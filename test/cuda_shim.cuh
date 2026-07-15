@@ -53,6 +53,11 @@ cudaError_t cudaMalloc(void** p, unsigned long n);
 template <typename T> cudaError_t cudaMalloc(T** p, unsigned long n) { return cudaMalloc((void**)p, n); }
 cudaError_t cudaFree(void* p);
 cudaError_t cudaMemsetAsync(void* p, int v, unsigned long n, cudaStream_t s);
+// v3.5 R1: the render-boost history copy
+enum cudaMemcpyKind { cudaMemcpyHostToDevice = 1, cudaMemcpyDeviceToHost = 2,
+                      cudaMemcpyDeviceToDevice = 3 };
+cudaError_t cudaMemcpyAsync(void* dst, const void* src, unsigned long n,
+                            cudaMemcpyKind kind, cudaStream_t s);
 
 __device__ int abs(int);
 

@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <map>
+#include <climits>
 
 #include "NRParams.h"
 
@@ -34,6 +35,8 @@ namespace {
 #define kExpBins     128
 #define kExpScale    256.0f
 #define kExpDead     0.006f
+// v3.5 R1 Render Boost — see nr_core.h
+#define kBoostCap    12.0f
 #define kSigmaMin    1e-4f
 #define kSigmaMax    0.25f
 
@@ -550,7 +553,8 @@ __global__ void TemporalKernel(NRParams p, int W, int H,
                                const float4* f0, const float4* f1, const float4* f2,
                                const float4* f3, const float4* f4, const float4* f5,
                                const float4* f6,
-                               const unsigned int* stats, float4* tmp)
+                               const unsigned int* stats, float4* tmp,
+                               const float4* hist)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -587,6 +591,12 @@ __global__ void TemporalKernel(NRParams p, int W, int H,
     const float invSpanS = 1.0f / (0.5f * thrMul * sigTY);
     const bool  zap = (reach >= 1) && (p.fireflyRemoval != 0) &&
                       (p.master > 0.0f) && (tL > 0.0f || tC > 0.0f);
+    // v3.5 R1: one extra candidate against the previous frame's temporal
+    // result — only when the host proved the history is frame-1 with the
+    // same dims and params (anything else falls back to the plain stack;
+    // the host always passes SOME pointer, histValid is the real gate)
+    const bool  boost = (p.renderBoost != 0) && (p.histValid != 0) &&
+                        (reach >= 1);
     const float zapY = 6.0f * sigTY;
     const float zapC = 6.0f * sigTC;
 
@@ -724,6 +734,54 @@ __global__ void TemporalKernel(NRParams p, int W, int H,
         accCr += wCr * fcrc;
         sumWY  += wY;
         sumWY2 += wY * wY;
+        sumWCb += wCb;
+        sumWCr += wCr;
+    }
+
+    // v3.5 R1 Render Boost: the history embodies effH frames, so its knee
+    // tightens by kneeH = sqrt((1+1/effH)/2), its weight scales with effH
+    // (inverse-variance, capped) and the gate applies QUADRATICALLY so a
+    // partial match cannot drag effH-times harder. History luma is read in
+    // frame-1's light, so its exposure offset applies. See nr_core.h.
+    if (boost) {
+        const float expOffPrev = __uint_as_float(stats[S_EXPOFF + 2]);
+        float hy9[9], hcb9[9], hcr9[9];
+        int j = 0;
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx, ++j) {
+                const float4 hp = sampleTmp(hist, W, H, x + dx, y + dy);
+                hy9[j] = hp.x - expOffPrev;
+                hcb9[j] = hp.y;
+                hcr9[j] = hp.z;
+            }
+        const float effH = clampf(sampleTmp(hist, W, H, x, y).w, 1.0f, kBoostCap);
+        float dY = 0.0f, dCb = 0.0f, dCr = 0.0f, sdY = 0.0f;
+        for (int j2 = 0; j2 < 9; ++j2) {
+            dY += fabsf(hy9[j2] - cy9[j2]);
+            sdY += (hy9[j2] - cy9[j2]);
+            dCb += fabsf(hcb9[j2] - ccb9[j2]);
+            dCr += fabsf(hcr9[j2] - ccr9[j2]);
+        }
+        dY *= (1.0f / 9.0f);
+        dCb *= (1.0f / 9.0f);
+        dCr *= (1.0f / 9.0f);
+        sdY *= (1.0f / 9.0f);
+
+        const float kneeH = sqrtf((1.0f + 1.0f / effH) * 0.5f);
+        float gY = 1.0f - smooth01f((dY - loY * gnY * kneeH) * invSpanY * invGnY / kneeH);
+        if (guard)
+            gY *= 1.0f - smooth01f((fabsf(sdY) - loS * gnY * kneeH) * invSpanS * invGnY / kneeH);
+        const float gCb = 1.0f - smooth01f((dCb - loCb * gnC * kneeH) * invSpanCb * invGnC / kneeH);
+        const float gCr = 1.0f - smooth01f((dCr - loCr * gnC * kneeH) * invSpanCr * invGnC / kneeH);
+        const float wY  = tL * gY * gY * effH;
+        const float wCb = tC * gCb * gY * gY * effH;
+        const float wCr = tC * gCr * gY * gY * effH;
+
+        accY  += wY * hy9[4];
+        accCb += wCb * hcb9[4];
+        accCr += wCr * hcr9[4];
+        sumWY  += wY;
+        sumWY2 += wY * wY / effH;
         sumWCb += wCb;
         sumWCr += wCr;
     }
@@ -1863,9 +1921,37 @@ struct StreamResources
 {
     float4* tmp = nullptr;
     float4* tmp2 = nullptr;   // v3.3 Deep Clean output (lazy — only when used)
+    float4* hist = nullptr;   // v3.5 R1 previous frame's temporal result (lazy)
     unsigned int* stats = nullptr;
     int w = 0, h = 0;
+    int histFrame = INT_MIN;  // frame index hist holds (INT_MIN = none)
+    unsigned int histHash = 0;// boostParamsHash at the time it was written
 };
+
+// v3.5 R1: the history is only usable when every parameter that shapes the
+// temporal result matches the render that wrote it. FNV-1a over the params
+// with the per-frame/display-only fields zeroed — frameIndex advances by
+// design, views and scopes never touch the temporal buffer, histValid is
+// this test's OUTPUT. hasTemporalDiff stays IN: clip-edge frames merge
+// differently and must invalidate the chain. (NRParams is all 4-byte
+// fields, no padding — byte-hashing a stack copy is deterministic.)
+inline unsigned int boostParamsHash(const NRParams& p)
+{
+    NRParams c = p;
+    c.frameIndex   = 0;
+    c.viewMode     = 0;
+    c.scopeMeasure = 0;
+    c.scopeMotion  = 0;
+    c.scopeEq      = 0;
+    c.histValid    = 0;
+    unsigned int h = 2166136261u;
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(&c);
+    for (size_t i = 0; i < sizeof(NRParams); ++i) {
+        h ^= b[i];
+        h *= 16777619u;
+    }
+    return h;
+}
 
 } // namespace
 
@@ -1876,6 +1962,19 @@ void RunCudaNR(void* p_Stream, int p_Width, int p_Height, const NRParams& p_Para
 
     static std::map<void*, StreamResources> s_resources;
     static Locker s_locker;
+
+    NRParams params = p_Params;
+    const float* partnerPtr = p_Srcs[3];
+    if (p_Srcs[2] != p_Srcs[3])      partnerPtr = p_Srcs[2];
+    else if (p_Srcs[4] != p_Srcs[3]) partnerPtr = p_Srcs[4];
+    params.hasTemporalDiff = (partnerPtr != p_Srcs[3]) ? 1 : 0;
+
+    // v3.5 R1 Render Boost: hash AFTER hasTemporalDiff is known — the
+    // validity test below runs under the resource lock
+    params.histValid = 0;
+    const unsigned int boostHash = boostParamsHash(params);
+    const bool wantBoost = (params.renderBoost != 0) && (params.enableTemporal != 0) &&
+                           (params.master > 0.0f);
 
     StreamResources res;
     s_locker.Lock();
@@ -1888,6 +1987,8 @@ void RunCudaNR(void* p_Stream, int p_Width, int p_Height, const NRParams& p_Para
             cudaMalloc(&r.tmp, static_cast<size_t>(p_Width) * p_Height * sizeof(float4));
             cudaMalloc(&r.stats, NR_STATS_UINTS * sizeof(unsigned int));
             if (r.tmp2) { cudaFree(r.tmp2); r.tmp2 = nullptr; }   // re-created lazily
+            if (r.hist) { cudaFree(r.hist); r.hist = nullptr; }   // v3.5 R1: ditto,
+            r.histFrame = INT_MIN;                                // and the chain breaks
             r.w = p_Width;
             r.h = p_Height;
         }
@@ -1897,18 +1998,20 @@ void RunCudaNR(void* p_Stream, int p_Width, int p_Height, const NRParams& p_Para
                               (p_Params.master > 0.0f);
         if (wantDeep && !r.tmp2)
             cudaMalloc(&r.tmp2, static_cast<size_t>(p_Width) * p_Height * sizeof(float4));
+        // v3.5 R1: the history buffer is lazy the same way, and the chain is
+        // only declared valid when the previous committed render was the
+        // immediately preceding frame with the same effective params
+        if (wantBoost && !r.hist)
+            cudaMalloc(&r.hist, static_cast<size_t>(p_Width) * p_Height * sizeof(float4));
+        if (wantBoost && r.hist && r.histFrame == params.frameIndex - 1 &&
+            r.histHash == boostHash)
+            params.histValid = 1;
         res = r;
     }
     s_locker.Unlock();
 
     if (!res.tmp || !res.stats)
         return;
-
-    NRParams params = p_Params;
-    const float* partnerPtr = p_Srcs[3];
-    if (p_Srcs[2] != p_Srcs[3])      partnerPtr = p_Srcs[2];
-    else if (p_Srcs[4] != p_Srcs[3]) partnerPtr = p_Srcs[4];
-    params.hasTemporalDiff = (partnerPtr != p_Srcs[3]) ? 1 : 0;
 
     const float4* srcs[7];
     for (int i = 0; i < 7; ++i)
@@ -1964,7 +2067,11 @@ void RunCudaNR(void* p_Stream, int p_Width, int p_Height, const NRParams& p_Para
     TemporalKernel<<<blocks, threads, 0, stream>>>(params, p_Width, p_Height,
                                                    srcs[0], srcs[1], srcs[2], srcs[3], srcs[4],
                                                    srcs[5], srcs[6],
-                                                   res.stats, res.tmp);
+                                                   res.stats, res.tmp,
+                                                   // v3.5 R1: res.tmp stands in when
+                                                   // there is no history buffer (the
+                                                   // kernel only reads it when histValid)
+                                                   res.hist ? res.hist : res.tmp);
 
     if (residualLive)
     {
@@ -2001,4 +2108,25 @@ void RunCudaNR(void* p_Stream, int p_Width, int p_Height, const NRParams& p_Para
     SpatialNLMKernel<<<blocks, threads, tileBytes, stream>>>(params, p_Width, p_Height,
                                                              working, srcs[3], res.stats, dst,
                                                              res.tmp);
+
+    // v3.5 R1: carry this frame's TRUE temporal result forward for the next
+    // sequential render. res.tmp is the right source even under Deep Clean
+    // (tmp2 holds the deep-cleaned copy; res.tmp stays the temporal output).
+    // Stream order guarantees the copy lands before the next frame's read.
+    if (wantBoost && res.hist)
+    {
+        cudaMemcpyAsync(res.hist, res.tmp,
+                        static_cast<size_t>(p_Width) * p_Height * sizeof(float4),
+                        cudaMemcpyDeviceToDevice, stream);
+        s_locker.Lock();
+        {
+            StreamResources& r = s_resources[p_Stream];
+            if (r.hist == res.hist)   // not replaced by a mid-flight resize
+            {
+                r.histFrame = params.frameIndex;
+                r.histHash  = boostHash;
+            }
+        }
+        s_locker.Unlock();
+    }
 }

@@ -77,6 +77,10 @@ typedef struct NRParams
     float lockSCr;         // locked Cr sigmas (B5 per-channel chroma:
     float lockTCr;         // lockSC/lockTC hold the Cb pair; old projects
                            // load with Cr = Cb)
+    int   renderBoost;     // v3.5 R1: blend against the previous frame's
+                           // temporal result (sequential renders only)
+    int   histValid;       // host-set: the history buffer matches frame-1,
+                           // same dims, same params hash
 } NRParams;
 
 // stats buffer layout (uint32 slots). v3.3 B5 re-layout: every chroma

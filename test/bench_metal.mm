@@ -42,8 +42,11 @@ static void makeFrame(std::vector<float>& img, int W, int H, float shift, uint32
 }
 
 static double benchOne(id<MTLCommandQueue> queue, int W, int H, const NRParams& p,
-                       float panPerFrame, int iters)
+                       float panPerFrame, int iters, bool sequentialFrames = false)
 {
+    // sequentialFrames: advance frameIndex every call so the v3.5 render-
+    // boost history chain stays valid — the realistic export case
+
     // min of 3 interleaved passes, each in its own autorelease pool, so
     // thermal drift and buffer lifetime can't skew one configuration
     double best = 1e30;
@@ -70,14 +73,21 @@ static double benchOne(id<MTLCommandQueue> queue, int W, int H, const NRParams& 
                 [fence waitUntilCompleted];
             };
 
-            // warmup (includes kernel compile on first call)
-            for (int i = 0; i < 3; ++i)
-                RunMetalNR((void*)queue, W, H, p, srcs, (float*)dstBuf);
+            // warmup (includes kernel compile on first call; primes the
+            // boost history chain in sequential mode)
+            for (int i = 0; i < 3; ++i) {
+                NRParams pi = p;
+                if (sequentialFrames) pi.frameIndex = i - 3;
+                RunMetalNR((void*)queue, W, H, pi, srcs, (float*)dstBuf);
+            }
             sync();
 
             const auto t0 = std::chrono::steady_clock::now();
-            for (int i = 0; i < iters; ++i)
-                RunMetalNR((void*)queue, W, H, p, srcs, (float*)dstBuf);
+            for (int i = 0; i < iters; ++i) {
+                NRParams pi = p;
+                if (sequentialFrames) pi.frameIndex = i;
+                RunMetalNR((void*)queue, W, H, pi, srcs, (float*)dstBuf);
+            }
             sync();
             const auto t1 = std::chrono::steady_clock::now();
 
@@ -127,6 +137,11 @@ int main()
     locked.profileLocked = 1;
     locked.lockSY = 0.03f; locked.lockSC = 0.02f; locked.lockTY = 0.028f; locked.lockTC = 0.018f;
 
+    // v3.5 R1: boost on, sequential frames — every timed call hits the
+    // history-valid path and pays the tmp->hist blit
+    NRParams boost = best;
+    boost.renderBoost = 1;
+
     struct { const char* name; int w, h; int iters; } sizes[] = {
         { "HD  1920x1080", 1920, 1080, 40 },
         { "UHD 3840x2160", 3840, 2160, 15 },
@@ -139,11 +154,12 @@ int main()
         const double msLock   = benchOne(queue, s.w, s.h, locked, 0.0f, s.iters);
         const double msSeven  = benchOne(queue, s.w, s.h, seven, 0.0f, s.iters);
         const double msFast   = benchOne(queue, s.w, s.h, fast, 0.0f, s.iters);
+        const double msBoost  = benchOne(queue, s.w, s.h, boost, 0.0f, s.iters, true);
         printf("%s   Better(NLM,R3,5f): static %6.2f ms (%5.1f fps)  panning %6.2f ms (%5.1f fps)  tracking-off %6.2f ms  locked %6.2f ms (%5.1f fps)\n",
                s.name, msStatic, 1000.0 / msStatic, msPan, 1000.0 / msPan, msNoTrk,
                msLock, 1000.0 / msLock);
-        printf("%s   7 Frames (NLM,R3): %6.2f ms (%5.1f fps)   Faster(Bilat,R2,3f): %6.2f ms (%5.1f fps)\n",
-               s.name, msSeven, 1000.0 / msSeven, msFast, 1000.0 / msFast);
+        printf("%s   7 Frames (NLM,R3): %6.2f ms (%5.1f fps)   Faster(Bilat,R2,3f): %6.2f ms (%5.1f fps)   Render Boost (5f seq): %6.2f ms (%5.1f fps)\n",
+               s.name, msSeven, 1000.0 / msSeven, msFast, 1000.0 / msFast, msBoost, 1000.0 / msBoost);
     }
     return 0;
 }

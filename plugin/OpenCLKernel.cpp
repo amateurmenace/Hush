@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <map>
+#include <climits>
 
 #ifdef __APPLE__
 #include <OpenCL/cl.h>
@@ -82,6 +83,8 @@ typedef struct NRParams
     int   deepClean;
     float lockSCr;
     float lockTCr;
+    int   renderBoost;
+    int   histValid;
 } NRParams;
 
 #define kMedianCal   0.247100f
@@ -104,6 +107,8 @@ typedef struct NRParams
 #define kExpBins     128
 #define kExpScale    256.0f
 #define kExpDead     0.006f
+// v3.5 R1 Render Boost — see nr_core.h
+#define kBoostCap    12.0f
 
 #define H_YF    0
 #define H_CFB   256
@@ -599,7 +604,8 @@ __kernel void TemporalKernel(NRParams p, int W, int H,
                              __global const float4* f2, __global const float4* f3,
                              __global const float4* f4, __global const float4* f5,
                              __global const float4* f6,
-                             __global const uint* stats, __global float4* tmp)
+                             __global const uint* stats, __global float4* tmp,
+                             __global const float4* hist)
 {
     const int x = get_global_id(0);
     const int y = get_global_id(1);
@@ -636,6 +642,12 @@ __kernel void TemporalKernel(NRParams p, int W, int H,
     const float invSpanS = 1.0f / (0.5f * thrMul * sigTYv);
     const int   zap = (reach >= 1) && (p.fireflyRemoval != 0) &&
                       (p.master > 0.0f) && (tL > 0.0f || tC > 0.0f);
+    // v3.5 R1: one extra candidate against the previous frame's temporal
+    // result — only when the host proved the history is frame-1 with the
+    // same dims and params (anything else falls back to the plain stack;
+    // the host always binds SOME buffer, histValid is the real gate)
+    const int   boost = (p.renderBoost != 0) && (p.histValid != 0) &&
+                        (reach >= 1);
     const float zapY = 6.0f * sigTYv;
     const float zapC = 6.0f * sigTC;
 
@@ -770,6 +782,53 @@ __kernel void TemporalKernel(NRParams p, int W, int H,
         accCr += wCr * fc.z;
         sumWY  += wY;
         sumWY2 += wY * wY;
+        sumWCb += wCb;
+        sumWCr += wCr;
+    }
+
+    // v3.5 R1 Render Boost: the history embodies effH frames, so its knee
+    // tightens by kneeH = sqrt((1+1/effH)/2), its weight scales with effH
+    // (inverse-variance, capped) and the gate applies QUADRATICALLY so a
+    // partial match cannot drag effH-times harder. History luma is read in
+    // frame-1's light, so its exposure offset applies. See nr_core.h.
+    if (boost) {
+        const float expOffPrev = as_float(stats[S_EXPOFF + 2]);
+        float3 h9[9];
+        int j = 0;
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx, ++j) {
+                float3 hv = sampleTmp(hist, W, H, x + dx, y + dy).xyz;
+                hv.x -= expOffPrev;
+                h9[j] = hv;
+            }
+        const float effH = clamp(sampleTmp(hist, W, H, x, y).w, 1.0f, kBoostCap);
+        float dY = 0.0f, dCb = 0.0f, dCr = 0.0f, sdY = 0.0f;
+        for (int j2 = 0; j2 < 9; ++j2) {
+            dY  += fabs(h9[j2].x - c9[j2].x);
+            sdY += (h9[j2].x - c9[j2].x);
+            dCb += fabs(h9[j2].y - c9[j2].y);
+            dCr += fabs(h9[j2].z - c9[j2].z);
+        }
+        dY  *= (1.0f / 9.0f);
+        dCb *= (1.0f / 9.0f);
+        dCr *= (1.0f / 9.0f);
+        sdY *= (1.0f / 9.0f);
+
+        const float kneeH = sqrt((1.0f + 1.0f / effH) * 0.5f);
+        float gY = 1.0f - smooth01f((dY - loY * gnY * kneeH) * invSpanY * invGnY / kneeH);
+        if (guard)
+            gY *= 1.0f - smooth01f((fabs(sdY) - loS * gnY * kneeH) * invSpanS * invGnY / kneeH);
+        const float gCb = 1.0f - smooth01f((dCb - loCb * gnC * kneeH) * invSpanCb * invGnC / kneeH);
+        const float gCr = 1.0f - smooth01f((dCr - loCr * gnC * kneeH) * invSpanCr * invGnC / kneeH);
+        const float wY  = tL * gY * gY * effH;
+        const float wCb = tC * gCb * gY * gY * effH;
+        const float wCr = tC * gCr * gY * gY * effH;
+
+        accY  += wY * h9[4].x;
+        accCb += wCb * h9[4].y;
+        accCr += wCr * h9[4].z;
+        sumWY  += wY;
+        sumWY2 += wY * wY / effH;
         sumWCb += wCb;
         sumWCr += wCr;
     }
@@ -1890,10 +1949,38 @@ struct QueueResources
     cl_kernel nlm = nullptr;
     cl_mem tmp = nullptr;
     cl_mem tmp2 = nullptr;   // v3.3 Deep Clean output (lazy — only when used)
+    cl_mem hist = nullptr;   // v3.5 R1 previous frame's temporal result (lazy)
     cl_mem stats = nullptr;
     int w = 0, h = 0;
     size_t nlmWG = 16;   // v3.3 A2: NLM workgroup side (16, or 8 on capped devices)
+    int histFrame = INT_MIN;   // frame index hist holds (INT_MIN = none)
+    cl_uint histHash = 0;      // boostParamsHash at the time it was written
 };
+
+// v3.5 R1: the history is only usable when every parameter that shapes the
+// temporal result matches the render that wrote it. FNV-1a over the params
+// with the per-frame/display-only fields zeroed — frameIndex advances by
+// design, views and scopes never touch the temporal buffer, histValid is
+// this test's OUTPUT. hasTemporalDiff stays IN: clip-edge frames merge
+// differently and must invalidate the chain. (NRParams is all 4-byte
+// fields, no padding — byte-hashing a stack copy is deterministic.)
+inline cl_uint boostParamsHash(const NRParams& p)
+{
+    NRParams c = p;
+    c.frameIndex   = 0;
+    c.viewMode     = 0;
+    c.scopeMeasure = 0;
+    c.scopeMotion  = 0;
+    c.scopeEq      = 0;
+    c.histValid    = 0;
+    cl_uint h = 2166136261u;
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(&c);
+    for (size_t i = 0; i < sizeof(NRParams); ++i) {
+        h ^= b[i];
+        h *= 16777619u;
+    }
+    return h;
+}
 
 } // namespace
 
@@ -1909,6 +1996,19 @@ void RunOpenCLNR(void* p_CmdQ, int p_Width, int p_Height, const NRParams& p_Para
     cl_context clContext = NULL;
     error = clGetCommandQueueInfo(cmdQ, CL_QUEUE_CONTEXT, sizeof(cl_context), &clContext, NULL);
     CheckError(error, "Unable to get the context");
+
+    NRParams params = p_Params;
+    const float* partner = p_Srcs[3];
+    if (p_Srcs[2] != p_Srcs[3])      partner = p_Srcs[2];
+    else if (p_Srcs[4] != p_Srcs[3]) partner = p_Srcs[4];
+    params.hasTemporalDiff = (partner != p_Srcs[3]) ? 1 : 0;
+
+    // v3.5 R1 Render Boost: hash AFTER hasTemporalDiff is known — the
+    // validity test below runs under the resource lock
+    params.histValid = 0;
+    const cl_uint boostHash = boostParamsHash(params);
+    const bool wantBoost = (params.renderBoost != 0) && (params.enableTemporal != 0) &&
+                           (params.master > 0.0f);
 
     QueueResources res;
     s_locker.Lock();
@@ -1965,6 +2065,8 @@ void RunOpenCLNR(void* p_CmdQ, int p_Width, int p_Height, const NRParams& p_Para
             if (r.tmp)   clReleaseMemObject(r.tmp);
             if (r.stats) clReleaseMemObject(r.stats);
             if (r.tmp2)  { clReleaseMemObject(r.tmp2); r.tmp2 = nullptr; }   // re-created lazily
+            if (r.hist)  { clReleaseMemObject(r.hist); r.hist = nullptr; }   // v3.5 R1: ditto,
+            r.histFrame = INT_MIN;                                           // and the chain breaks
             r.tmp = clCreateBuffer(clContext, CL_MEM_READ_WRITE,
                                    static_cast<size_t>(p_Width) * p_Height * 4 * sizeof(float), NULL, &error);
             r.stats = clCreateBuffer(clContext, CL_MEM_READ_WRITE,
@@ -1982,18 +2084,24 @@ void RunOpenCLNR(void* p_CmdQ, int p_Width, int p_Height, const NRParams& p_Para
                                     static_cast<size_t>(p_Width) * p_Height * 4 * sizeof(float), NULL, &error);
             CheckError(error, "Unable to create deep-clean buffer");
         }
+        // v3.5 R1: the history buffer is lazy the same way, and the chain is
+        // only declared valid when the previous committed render was the
+        // immediately preceding frame with the same effective params
+        if (wantBoost && !r.hist)
+        {
+            r.hist = clCreateBuffer(clContext, CL_MEM_READ_WRITE,
+                                    static_cast<size_t>(p_Width) * p_Height * 4 * sizeof(float), NULL, &error);
+            CheckError(error, "Unable to create history buffer");
+        }
+        if (wantBoost && r.hist && r.histFrame == params.frameIndex - 1 &&
+            r.histHash == boostHash)
+            params.histValid = 1;
         res = r;
     }
     s_locker.Unlock();
 
     if (!res.est || !res.tmp)
         return;
-
-    NRParams params = p_Params;
-    const float* partner = p_Srcs[3];
-    if (p_Srcs[2] != p_Srcs[3])      partner = p_Srcs[2];
-    else if (p_Srcs[4] != p_Srcs[3]) partner = p_Srcs[4];
-    params.hasTemporalDiff = (partner != p_Srcs[3]) ? 1 : 0;
 
     int W = p_Width, H = p_Height;
     // v3.3 lock fast path: a locked profile still runs input estimation when
@@ -2083,6 +2191,10 @@ void RunOpenCLNR(void* p_CmdQ, int p_Width, int p_Height, const NRParams& p_Para
             error |= clSetKernelArg(res.temp, c++, sizeof(cl_mem), &p_Srcs[i]);
         error |= clSetKernelArg(res.temp, c++, sizeof(cl_mem), &res.stats);
         error |= clSetKernelArg(res.temp, c++, sizeof(cl_mem), &res.tmp);
+        // v3.5 R1: history at the last slot — res.tmp stands in when there
+        // is none (the kernel only reads it when histValid)
+        cl_mem histArg = res.hist ? res.hist : res.tmp;
+        error |= clSetKernelArg(res.temp, c++, sizeof(cl_mem), &histArg);
         CheckError(error, "temporal args");
         error = clEnqueueNDRangeKernel(cmdQ, res.temp, 2, NULL, global, NULL, 0, NULL, NULL);
         CheckError(error, "temporal enqueue");
@@ -2181,5 +2293,27 @@ void RunOpenCLNR(void* p_CmdQ, int p_Width, int p_Height, const NRParams& p_Para
                                 (static_cast<size_t>(H) + wg - 1) / wg * wg };
         error = clEnqueueNDRangeKernel(cmdQ, res.nlm, 2, NULL, globalNlm, localNlm, 0, NULL, NULL);
         CheckError(error, "nlm enqueue");
+    }
+
+    // v3.5 R1: carry this frame's TRUE temporal result forward for the next
+    // sequential render. res.tmp is the right source even under Deep Clean
+    // (tmp2 holds the deep-cleaned copy; res.tmp stays the temporal output).
+    // In-order queue semantics land the copy before the next frame's read.
+    if (wantBoost && res.hist)
+    {
+        error = clEnqueueCopyBuffer(cmdQ, res.tmp, res.hist, 0, 0,
+                                    static_cast<size_t>(p_Width) * p_Height * 4 * sizeof(float),
+                                    0, NULL, NULL);
+        CheckError(error, "history copy");
+        s_locker.Lock();
+        {
+            QueueResources& r = s_resources[p_CmdQ];
+            if (r.hist == res.hist)   // not replaced by a mid-flight resize
+            {
+                r.histFrame = params.frameIndex;
+                r.histHash  = boostHash;
+            }
+        }
+        s_locker.Unlock();
     }
 }

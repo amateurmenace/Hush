@@ -14,7 +14,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
+#include <climits>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -27,6 +30,31 @@
 #include "ofxDrawSuite.h"
 
 #include "NRParams.h"
+
+// v3.5 R1: the render-boost history is only usable when every parameter that
+// shapes the temporal result matches the render that wrote it. FNV-1a over
+// the params with the per-frame/display-only fields zeroed — frameIndex
+// advances by design, views and scopes never touch the temporal buffer,
+// histValid is this test's OUTPUT. hasTemporalDiff stays IN: clip-edge
+// frames merge differently and must invalidate the chain. Keep in sync with
+// the three GPU hosts. (NRParams is all 4-byte fields, no padding.)
+static uint32_t boostParamsHash(const NRParams& p)
+{
+    NRParams c = p;
+    c.frameIndex   = 0;
+    c.viewMode     = 0;
+    c.scopeMeasure = 0;
+    c.scopeMotion  = 0;
+    c.scopeEq      = 0;
+    c.histValid    = 0;
+    uint32_t h = 2166136261u;
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(&c);
+    for (size_t i = 0; i < sizeof(NRParams); ++i) {
+        h ^= b[i];
+        h *= 16777619u;
+    }
+    return h;
+}
 #include "nr_core.h"
 #include "nr_analyze.h"
 
@@ -170,6 +198,7 @@ public:
         m_TemporalChroma = fetchDoubleParam("temporalChroma");
         m_MotionThresh   = fetchDoubleParam("motionThreshold");
         m_FireflyRemoval = fetchBooleanParam("fireflyRemoval");
+        m_RenderBoost    = fetchBooleanParam("renderBoost");
         m_EnableSpatial  = fetchBooleanParam("enableSpatial");
         m_SpatialMode    = fetchChoiceParam("spatialMethod");
         m_SpatialRadius  = fetchIntParam("spatialRadius");
@@ -536,12 +565,13 @@ private:
         std::string lockStr;
         m_LockData->getValue(lockStr);
         snprintf(buf, sizeof(buf),
-                 "v1|et=%d|tf=%d|tl=%.17g|tc=%.17g|mt=%.17g|mtr=%d|ff=%d|gg=%d|es=%d|sm=%d|sr=%d|"
+                 "v1|et=%d|tf=%d|tl=%.17g|tc=%.17g|mt=%.17g|mtr=%d|ff=%d|gg=%d|rb=%d|es=%d|sm=%d|sr=%d|"
                  "sl=%.17g|sc=%.17g|pd=%.17g|rs=%.17g|dc=%d|cb=%.17g|eqf=%.17g|eqm=%.17g|eqc=%.17g|pa=%.17g|lp=%d|ld=%s",
                  m_EnableTemporal->getValue() ? 1 : 0, tf,
                  m_TemporalLuma->getValue(), m_TemporalChroma->getValue(), m_MotionThresh->getValue(),
                  m_MotionTracking->getValue() ? 1 : 0, m_FireflyRemoval->getValue() ? 1 : 0,
                  m_GhostGuard->getValue() ? 1 : 0,
+                 m_RenderBoost->getValue() ? 1 : 0,
                  m_EnableSpatial->getValue() ? 1 : 0, sm, m_SpatialRadius->getValue(),
                  m_SpatialLuma->getValue(), m_SpatialChroma->getValue(),
                  m_PreserveDetail->getValue(), m_DetailRescue->getValue(),
@@ -822,6 +852,7 @@ private:
         m_TemporalChroma->setEnabled(tOn);
         m_MotionThresh->setEnabled(tOn);
         m_FireflyRemoval->setEnabled(tOn);
+        m_RenderBoost->setEnabled(tOn);
 
         const bool sOn = m_EnableSpatial->getValue();
         m_SpatialMode->setEnabled(sOn);
@@ -924,6 +955,9 @@ private:
             p.lockGainY[b] = locked ? m_LockAgg.gainY[b] : 1.0f;
             p.lockGainC[b] = locked ? m_LockAgg.gainC[b] : 1.0f;
         }
+        // ---- v3.5 ----
+        p.renderBoost     = m_RenderBoost->getValueAtTime(t) ? 1 : 0;
+        p.histValid       = 0;   // decided per render by the GPU/CPU hosts
         return p;
     }
 
@@ -1048,6 +1082,9 @@ private:
             p.lockGainY[b2] = params.lockGainY[b2];
             p.lockGainC[b2] = params.lockGainC[b2];
         }
+        // ---- v3.5 R1 ----
+        p.renderBoost    = params.renderBoost;
+        p.histValid      = 0;   // decided against the instance cache below
 
         const size_t n = static_cast<size_t>(W) * H * 4;
         std::vector<std::vector<float>> packed;
@@ -1074,8 +1111,48 @@ private:
             fptr[i] = buf.data();
         }
 
+        // v3.5 R1: sequential-render history — the same validity contract as
+        // the GPU hosts (previous committed render was frame-1, same dims,
+        // same effective params). hasTemporalDiff is derived here exactly as
+        // the GPU hosts derive it, so clip edges invalidate the chain.
+        const bool wantBoost = (params.renderBoost != 0) && (params.enableTemporal != 0) &&
+                               (params.master > 0.0f);
+        NRParams hashSrc = params;
+        const float* partnerPtr = fptr[3];
+        if (fptr[2] != fptr[3])      partnerPtr = fptr[2];
+        else if (fptr[4] != fptr[3]) partnerPtr = fptr[4];
+        hashSrc.hasTemporalDiff = (partnerPtr != fptr[3]) ? 1 : 0;
+        hashSrc.histValid = 0;
+        const uint32_t boostHash = boostParamsHash(hashSrc);
+
+        std::vector<float> histCopy;
+        if (wantBoost)
+        {
+            std::lock_guard<std::mutex> lk(m_CpuHistMutex);
+            if (m_CpuHistFrame == params.frameIndex - 1 && m_CpuHistHash == boostHash &&
+                m_CpuHistW == W && m_CpuHistH == H && m_CpuHist.size() == n)
+            {
+                histCopy = m_CpuHist;   // copy out — a concurrent render may
+                p.histValid = 1;        // replace the member while we read
+            }
+        }
+
         std::vector<float> out(n), scratch;
-        nrcore::denoiseFrame(fptr, W, H, p, out.data(), scratch);
+        nrcore::denoiseFrame(fptr, W, H, p, out.data(), scratch,
+                             p.histValid ? histCopy.data() : 0);
+
+        // publish this frame's TRUE temporal result (scratch's first plane —
+        // under Deep Clean the second plane holds the cleaned copy) for the
+        // next sequential render
+        if (wantBoost && scratch.size() >= n)
+        {
+            std::lock_guard<std::mutex> lk(m_CpuHistMutex);
+            m_CpuHist.assign(scratch.begin(), scratch.begin() + n);
+            m_CpuHistFrame = params.frameIndex;
+            m_CpuHistHash  = boostHash;
+            m_CpuHistW = W;
+            m_CpuHistH = H;
+        }
 
         const OfxRectI& db = dst->getBounds();
         for (int y = 0; y < H; ++y)
@@ -1098,6 +1175,7 @@ private:
     OFX::StringParam*  m_LockData = nullptr;
     OFX::BooleanParam* m_MotionTracking = nullptr;
     OFX::BooleanParam* m_FireflyRemoval = nullptr;
+    OFX::BooleanParam* m_RenderBoost = nullptr;
     OFX::DoubleParam*  m_EqFine = nullptr;
     OFX::DoubleParam*  m_EqMedium = nullptr;
     OFX::DoubleParam*  m_EqCoarse = nullptr;
@@ -1105,6 +1183,12 @@ private:
     nranalyze::ClipAggregate m_LockAgg;
     bool m_LockValid = false;
     bool m_InAutoApply = false;
+    // v3.5 R1: CPU-path render-boost history (same contract as the GPU hosts)
+    std::vector<float> m_CpuHist;
+    int m_CpuHistFrame = INT_MIN;
+    uint32_t m_CpuHistHash = 0;
+    int m_CpuHistW = 0, m_CpuHistH = 0;
+    std::mutex m_CpuHistMutex;
     OFX::ChoiceParam*  m_ProfileSource = nullptr;
     OFX::DoubleParam*  m_ProfileAdjust = nullptr;
     OFX::DoubleParam*  m_SigmaY = nullptr;
@@ -1565,6 +1649,11 @@ void OpenNRPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, 
                "real moving detail is left alone; turn off only if strobes or glints lose "
                "their one-frame flash.",
                true, grpTemporal);
+    defineBool(p_Desc, page, "renderBoost", "Render Boost",
+               "Blends against the previous rendered frame too, compounding the averaging "
+               "on static areas — up to about twice the frames. Sequential playback and "
+               "renders only; scrubbing or parameter changes fall back automatically.",
+               false, grpTemporal);
     defineBool(p_Desc, page, "scopeMotion", "Scope: Motion Map",
                "Draws a live mini-map in the viewer: green where frames are being stacked, "
                "red where motion protection kicked in. Turn off before rendering.",

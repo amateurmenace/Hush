@@ -148,6 +148,11 @@ struct Params {
     float lockSCr        = 0.02f;  // B5 per-channel chroma: lockSC/lockTC
     float lockTCr        = 0.02f;  // hold Cb, these hold Cr (old locks load
                                    // with Cr = Cb)
+
+    // ---- v3.5 ----
+    int   renderBoost    = 0;      // R1: recursive accumulation against the
+                                   // previous frame's temporal result
+    int   histValid      = 0;      // host-set validity of that history
 };
 
 // Sigmas and everything the analysis HUD displays.
@@ -204,6 +209,10 @@ static const float kSigmaMax    = 0.25f;
 static const int   kExpBins  = 128;
 static const float kExpScale = 256.0f;
 static const float kExpDead  = 0.006f;
+// v3.5 R1 Render Boost: the history candidate's weight scales with the
+// effective frame count it embodies (inverse-variance), capped so a long
+// static run cannot freeze the image or accumulate drift.
+static const float kBoostCap = 12.0f;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -653,8 +662,12 @@ inline void estimateInput(const float* rgba, const float* diffPartner,
 // ---------------------------------------------------------------------------
 // Stage 2 — motion-adaptive temporal merge (hard-knee gate)
 // ---------------------------------------------------------------------------
+// hist (v3.5 R1, nullable): the previous frame's TRUE temporal result
+// (YCbCr + effN), used as one extra gated candidate when Render Boost is on
+// and the host declared it valid.
 inline void temporalMerge(const float* const frames[7], int W, int H,
-                          const Params& p, const Stats& s, float* tmp)
+                          const Params& p, const Stats& s, float* tmp,
+                          const float* hist = 0)
 {
     const float mLow  = std::min(p.master, 1.0f);
     const float mHigh = std::max(p.master, 1.0f);
@@ -693,6 +706,11 @@ inline void temporalMerge(const float* const frames[7], int W, int H,
     // (identity when master is 0 or the stage contributes nothing).
     const bool  zap = (reach >= 1) && (p.fireflyRemoval != 0) &&
                       (p.master > 0.0f) && (tL > 0.0f || tC > 0.0f);
+    // v3.5 R1: one extra candidate against the previous frame's temporal
+    // result — only when the host proved the history is frame-1 with the
+    // same dims and params (anything else falls back to the plain stack)
+    const bool  boost = (p.renderBoost != 0) && (p.histValid != 0) &&
+                        (hist != 0) && (reach >= 1);
     const float zapY = 6.0f * s.ty;
     const float zapC = 6.0f * s.tc;
 
@@ -900,6 +918,63 @@ inline void temporalMerge(const float* const frames[7], int W, int H,
                 accCr += wCr * fcr9c;
                 sumWY  += wY;
                 sumWY2 += wY * wY;
+                sumWCb += wCb;
+                sumWCr += wCr;
+            }
+
+            // v3.5 R1 Render Boost: the history embodies effH frames, so a
+            // diff against it has sigma*sqrt(1+1/effH) instead of the pair
+            // calibration's sqrt(2)*sigma — the knee START and span tighten
+            // by kneeH = sqrt((1+1/effH)/2), which also makes coherent-change
+            // detection SHARPER against the cleaner reference. The weight
+            // scales with effH (inverse-variance optimum, capped), its
+            // variance term enters effN as w^2/effH, and Ghost Guard gates
+            // the signed mean as for any neighbour. The exposure offset of
+            // frame-1 applies: the history was written in that frame's light.
+            if (boost) {
+                float hy9[9], hcb9[9], hcr9[9];
+                int j = 0;
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx, ++j) {
+                        const float* hp = tmpAt(hist, W, H, x + dx, y + dy);
+                        hy9[j] = hp[0] - expOff[2];
+                        hcb9[j] = hp[1];
+                        hcr9[j] = hp[2];
+                    }
+                const float effH = clampf(tmpAt(hist, W, H, x, y)[3], 1.0f, kBoostCap);
+                float dY = 0.0f, dCb = 0.0f, dCr = 0.0f, sdY = 0.0f;
+                for (int j2 = 0; j2 < 9; ++j2) {
+                    dY += std::fabs(hy9[j2] - cy9[j2]);
+                    sdY += (hy9[j2] - cy9[j2]);
+                    dCb += std::fabs(hcb9[j2] - ccb9[j2]);
+                    dCr += std::fabs(hcr9[j2] - ccr9[j2]);
+                }
+                dY *= (1.0f / 9.0f);
+                dCb *= (1.0f / 9.0f);
+                dCr *= (1.0f / 9.0f);
+                sdY *= (1.0f / 9.0f);
+
+                const float kneeH = std::sqrt((1.0f + 1.0f / effH) * 0.5f);
+                float gY = 1.0f - smooth01((dY - loY * gnY * kneeH) * invSpanY * invGnY / kneeH);
+                if (guard)
+                    gY *= 1.0f - smooth01((std::fabs(sdY) - loS * gnY * kneeH) * invSpanS * invGnY / kneeH);
+                const float gCb = 1.0f - smooth01((dCb - loCb * gnC * kneeH) * invSpanCb * invGnC / kneeH);
+                const float gCr = 1.0f - smooth01((dCr - loCr * gnC * kneeH) * invSpanCr * invGnC / kneeH);
+                // the history carries effH-times the weight of a neighbour,
+                // so a PARTIAL match must not drag effH-times harder: its
+                // gate applies quadratically. Full matches (static content,
+                // gY ~ 1) are untouched; a 60% match keeps 36% instead of
+                // dragging 7x. Measured: this returned the panning chain to
+                // the boost-off number while keeping the static +2 dB.
+                const float wY = tL * gY * gY * effH;
+                const float wCb = tC * gCb * gY * gY * effH;
+                const float wCr = tC * gCr * gY * gY * effH;
+
+                accY  += wY * hy9[4];
+                accCb += wCb * hcb9[4];
+                accCr += wCr * hcr9[4];
+                sumWY  += wY;
+                sumWY2 += wY * wY / effH;
                 sumWCb += wCb;
                 sumWCr += wCr;
             }
@@ -2038,8 +2113,11 @@ inline void spatialNLM(const float* tmp, const float* tmpTrue, const float* curr
 // ---------------------------------------------------------------------------
 // Convenience full pipeline (CPU). Returns the stats actually used.
 // ---------------------------------------------------------------------------
+// hist (v3.5 R1, nullable): previous frame's temporal result for Render
+// Boost — the caller owns validity (p.histValid).
 inline Stats denoiseFrame(const float* const frames[7], int W, int H,
-                          const Params& p, float* out, std::vector<float>& scratch)
+                          const Params& p, float* out, std::vector<float>& scratch,
+                          const float* hist = 0)
 {
     // v3.3: Deep Clean is a within-frame pass — it follows the spatial
     // stage's enable and the master switch so identity states stay identity.
@@ -2054,7 +2132,7 @@ inline Stats denoiseFrame(const float* const frames[7], int W, int H,
 
     Stats s;
     estimateInput(frames[3], partner, W, H, p, s);
-    temporalMerge(frames, W, H, p, s, tmp);
+    temporalMerge(frames, W, H, p, s, tmp, hist);
     estimateResidual(tmp, W, H, p, s);
     if (deep) {
         deepCleanPass(tmp, W, H, p, s, tmp2);

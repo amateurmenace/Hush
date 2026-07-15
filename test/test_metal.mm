@@ -98,6 +98,8 @@ static void toCpuParams(const NRParams& gp, nrcore::Params& cp)
     cp.deepClean      = gp.deepClean;
     cp.lockSCr        = gp.lockSCr;
     cp.lockTCr        = gp.lockTCr;
+    cp.renderBoost    = gp.renderBoost;
+    cp.histValid      = gp.histValid;
 }
 
 // sparseOK: cases that exercise the v3 shift-search selection. Picking the
@@ -186,6 +188,93 @@ static int compareRun(id<MTLCommandQueue> queue, const NRParams& gp, const char*
     printf("  [%s] %-36s max %.2e  mean %.2e  over %zu\n",
            pass ? "PASS" : "FAIL", label, maxd, meand, nOver);
     return pass ? 0 : 1;
+}
+
+// v3.5 R1 Render Boost parity: two sequential calls through the REAL entry
+// point — the first primes the host history cache (frame 100), the second
+// consumes it (frame 101; its CPU mirror gets the CPU tmp plane from call 1
+// with histValid=1). A third call at a NON-consecutive frame (200) must fall
+// back to boost-off exactly — that one verifies the host validity logic
+// rather than the kernel math. Static scene (panPx 0) so the boost gates
+// actually open; stacks A and B use different seeds.
+static int compareBoost(id<MTLCommandQueue> queue, NRParams gp)
+{
+    std::vector<std::vector<float>> fA(7), fB(7);
+    for (int k = 0; k < 7; ++k) {
+        makeFrame(fA[k], k - 3, 300 + (k - 3) + 2, 0.0f);
+        makeFrame(fB[k], k - 3, 400 + (k - 3) + 2, 0.0f);
+    }
+    const float* fpA[7] = { fA[0].data(), fA[1].data(), fA[2].data(), fA[3].data(),
+                            fA[4].data(), fA[5].data(), fA[6].data() };
+    const float* fpB[7] = { fB[0].data(), fB[1].data(), fB[2].data(), fB[3].data(),
+                            fB[4].data(), fB[5].data(), fB[6].data() };
+
+    gp.renderBoost = 1;
+    gp.histValid = 0;   // the host decides this; the incoming value is ignored
+
+    nrcore::Params cp;
+    toCpuParams(gp, cp);
+
+    const size_t n = static_cast<size_t>(W) * H * 4;
+    std::vector<float> cpuOut1(n), cpuOut2(n), cpuOut3(n);
+    std::vector<float> scratchA, scratchB, scratchC;
+    cp.frameIndex = 100;                       // cold cache: boost-off math
+    nrcore::denoiseFrame(fpA, W, H, cp, cpuOut1.data(), scratchA);
+    cp.frameIndex = 101; cp.histValid = 1;     // scratchA's first plane IS
+    nrcore::denoiseFrame(fpB, W, H, cp, cpuOut2.data(), scratchB,
+                         scratchA.data());     // call 1's temporal result
+    cp.frameIndex = 200; cp.histValid = 0;     // validity miss: boost-off
+    nrcore::denoiseFrame(fpB, W, H, cp, cpuOut3.data(), scratchC);
+
+    id<MTLDevice> device = queue.device;
+    const size_t bytes = n * sizeof(float);
+    id<MTLBuffer> srcA[7], srcB[7];
+    const float* srcsA[7];
+    const float* srcsB[7];
+    for (int i = 0; i < 7; ++i) {
+        srcA[i] = [device newBufferWithBytes:fA[i].data() length:bytes options:MTLResourceStorageModeShared];
+        srcB[i] = [device newBufferWithBytes:fB[i].data() length:bytes options:MTLResourceStorageModeShared];
+        srcsA[i] = (const float*)srcA[i];
+        srcsB[i] = (const float*)srcB[i];
+    }
+    id<MTLBuffer> dstA = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dstB = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> dstC = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+
+    gp.frameIndex = 100;
+    RunMetalNR((void*)queue, W, H, gp, srcsA, (float*)dstA);
+    gp.frameIndex = 101;
+    RunMetalNR((void*)queue, W, H, gp, srcsB, (float*)dstB);
+    gp.frameIndex = 200;
+    RunMetalNR((void*)queue, W, H, gp, srcsB, (float*)dstC);
+
+    id<MTLCommandBuffer> fence = [queue commandBuffer];
+    [fence commit];
+    [fence waitUntilCompleted];
+
+    int failures = 0;
+    const struct { id<MTLBuffer> gpu; const float* cpu; const char* label; } cases[3] = {
+        { dstA, cpuOut1.data(), "v3.5 boost call 1 (cold = boost-off)" },
+        { dstB, cpuOut2.data(), "v3.5 boost call 2 (history engaged)" },
+        { dstC, cpuOut3.data(), "v3.5 boost call 3 (miss = boost-off)" },
+    };
+    for (int c = 0; c < 3; ++c) {
+        const float* g = static_cast<const float*>(cases[c].gpu.contents);
+        double maxd = 0.0, sumd = 0.0;
+        size_t nOver = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const double d = std::fabs(g[i] - cases[c].cpu[i]);
+            maxd = std::max(maxd, d);
+            sumd += d;
+            if (d > 5e-3) ++nOver;
+        }
+        const double meand = sumd / n;
+        const bool pass = (maxd < 5e-3) && (meand < 1e-4);
+        printf("  [%s] %-36s max %.2e  mean %.2e  over %zu\n",
+               pass ? "PASS" : "FAIL", cases[c].label, maxd, meand, nOver);
+        if (!pass) ++failures;
+    }
+    return failures;
 }
 
 int main()
@@ -399,6 +488,9 @@ int main()
 
     NRParams s7d = s7; s7d.deepClean = 1; s7d.viewMode = 6;
     failures += compareRun(queue, s7d, "v3.3 7f + deep clean, activity view");
+
+    // v3.5 R1 Render Boost: sequential-call history cache + kernel block
+    failures += compareBoost(queue, p);
 
     printf(failures == 0 ? "ALL GPU PARITY CHECKS PASSED\n" : "%d GPU PARITY CHECK(S) FAILED\n", failures);
     return failures == 0 ? 0 : 1;

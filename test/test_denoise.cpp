@@ -1500,6 +1500,105 @@ int main()
     }
 
     // =====================================================================
+    // v3.5 R1 — Render Boost: recursive accumulation on sequential renders
+    // =====================================================================
+    {
+        // a 6-frame sequential chain over a static clip: each render feeds
+        // its TRUE temporal result (scratch's first plane) to the next
+        auto buildStack = [](int t, std::vector<std::vector<float>>& fr) {
+            fr.assign(7, {});
+            for (int k = 0; k < 7; ++k) {
+                renderScene(fr[k], 0.0f, 0.0f);
+                addNoise(fr[k], 0.05f, 5000u + static_cast<uint32_t>(t + k - 3));
+            }
+        };
+        std::vector<float> clean;
+        renderScene(clean, 0, 0);
+        const size_t plane = static_cast<size_t>(W) * H * 4;
+
+        auto runChain = [&](bool boost, double& lastPsnr, float& lastEffN) {
+            std::vector<float> histBuf, out(plane), scratch;
+            nrcore::Stats st;
+            for (int t = 0; t < 6; ++t) {
+                std::vector<std::vector<float>> fr;
+                buildStack(t, fr);
+                const float* fp[7] = { fr[0].data(), fr[1].data(), fr[2].data(),
+                                       fr[3].data(), fr[4].data(), fr[5].data(),
+                                       fr[6].data() };
+                nrcore::Params pb = p;
+                pb.renderBoost = boost ? 1 : 0;
+                pb.histValid = (boost && t > 0) ? 1 : 0;
+                pb.frameIndex = t;
+                st = nrcore::denoiseFrame(fp, W, H, pb, out.data(), scratch,
+                                          (boost && t > 0) ? histBuf.data() : 0);
+                histBuf.assign(scratch.begin(), scratch.begin() + plane);
+            }
+            lastPsnr = psnr(out, clean);
+            lastEffN = st.effNMed;
+        };
+        double pOff = 0.0, pOn = 0.0;
+        float nOff = 0.0f, nOn = 0.0f;
+        runChain(false, pOff, nOff);
+        runChain(true, pOn, nOn);
+        printf("v3.5 render boost, 6-frame chain: off %5.2f dB (effN %.1f) -> on %5.2f dB (effN %.1f)\n",
+               pOff, nOff, pOn, nOn);
+        check(pOn >= pOff + 0.7, "render boost gains >= 0.7 dB on a static chain");
+        check(nOn > nOff + 1.5f, "render boost measurably deepens the stack");
+
+        // motion safety: a panning chain must not smear (gate + Ghost Guard
+        // + the tightened knee against the cleaner reference)
+        auto runPanChain = [&](bool boost) {
+            std::vector<float> histBuf, out(plane), scratch;
+            for (int t = 0; t < 4; ++t) {
+                std::vector<std::vector<float>> fr;
+                fr.assign(7, {});
+                for (int k = 0; k < 7; ++k) {
+                    renderScene(fr[k], 1.5f * (t + k - 3), 0.0f);
+                    addNoise(fr[k], 0.05f, 6000u + static_cast<uint32_t>(t + k - 3));
+                }
+                const float* fp[7] = { fr[0].data(), fr[1].data(), fr[2].data(),
+                                       fr[3].data(), fr[4].data(), fr[5].data(),
+                                       fr[6].data() };
+                nrcore::Params pb = p;
+                pb.motionTracking = 1;
+                pb.renderBoost = boost ? 1 : 0;
+                pb.histValid = (boost && t > 0) ? 1 : 0;
+                pb.frameIndex = t;
+                nrcore::denoiseFrame(fp, W, H, pb, out.data(), scratch,
+                                     (boost && t > 0) ? histBuf.data() : 0);
+                histBuf.assign(scratch.begin(), scratch.begin() + plane);
+            }
+            std::vector<float> cleanT;
+            renderScene(cleanT, 1.5f * 3, 0.0f);
+            return psnr(out, cleanT);
+        };
+        const double panOffB = runPanChain(false);
+        const double panOnB = runPanChain(true);
+        printf("v3.5 render boost, panning chain: off %5.2f dB, on %5.2f dB\n", panOffB, panOnB);
+        check(panOnB >= panOffB - 0.05, "render boost never smears a pan");
+
+        // an invalid history must be EXACTLY the boost-off path
+        {
+            std::vector<std::vector<float>> fr;
+            buildStack(9, fr);
+            const float* fp[7] = { fr[0].data(), fr[1].data(), fr[2].data(),
+                                   fr[3].data(), fr[4].data(), fr[5].data(),
+                                   fr[6].data() };
+            std::vector<float> o1(plane), o2(plane), scratch, junkHist(plane, 0.5f);
+            nrcore::Params pb = p;
+            pb.renderBoost = 1;
+            pb.histValid = 0;   // host says no
+            nrcore::denoiseFrame(fp, W, H, pb, o1.data(), scratch, junkHist.data());
+            nrcore::Params po = p;
+            nrcore::denoiseFrame(fp, W, H, po, o2.data(), scratch);
+            float maxd = 0.0f;
+            for (size_t i = 0; i < o1.size(); ++i)
+                maxd = std::max(maxd, std::fabs(o1[i] - o2[i]));
+            check(maxd == 0.0f, "invalid history is bit-exact with boost off");
+        }
+    }
+
+    // =====================================================================
     // v3.5 P1 — exposure match: a step or flicker must not gate the stack out
     // =====================================================================
     {

@@ -1,0 +1,32 @@
+HUSH OPEN NR — WINDOWS INSTALL
+==============================
+
+Easiest: double-click "Install OpenNR (Windows).bat" (it asks for admin and
+copies the bundle for you).
+
+Or do it by hand — it's one drag:
+
+  1. Open File Explorer and go to:
+
+        C:\Program Files\Common Files\OFX\Plugins
+
+     (Create the OFX\Plugins folders if they don't exist yet.)
+
+  2. Drag the whole "OpenNR.ofx.bundle" folder from this zip into that folder.
+
+  3. Restart DaVinci Resolve.
+
+  4. Find the effect under:
+
+        Effects  >  OpenFX  >  Filters  >  Hush  >  Hush Open NR
+
+     Works in the FREE version of Resolve and in Studio (Resolve 17 or newer).
+
+Notes
+-----
+- This Windows build renders through OpenCL, which works on NVIDIA, AMD and
+  Intel GPUs (a CUDA-native build is planned once verified on hardware).
+- If the effect doesn't appear after a restart, delete Resolve's plugin scan
+  cache and restart again:
+      %APPDATA%\Blackmagic Design\DaVinci Resolve\Support\OFXPluginCacheV2.xml
+- Questions or problems: https://github.com/amateurmenace/OpenNR/issues

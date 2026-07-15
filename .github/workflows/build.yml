@@ -34,3 +34,37 @@ jobs:
           path: |
             release/*.pkg
             release/*.zip
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenCL (vcpkg)
+        run: vcpkg install opencl:x64-windows
+
+      - name: Configure
+        run: cmake -B build -A x64 -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path build_release.sh -Pattern 'VERSION="([0-9.]+)"').Matches[0].Groups[1].Value
+          $stage = "stage/OpenNR.ofx.bundle/Contents/Win64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item build/Release/OpenNR.ofx $stage/
+          Copy-Item plugin/Info.plist stage/OpenNR.ofx.bundle/Contents/
+          Copy-Item "installer/Install OpenNR (Windows).bat" stage/
+          Copy-Item installer/INSTALL-WINDOWS.txt stage/
+          Copy-Item LICENSE stage/
+          Compress-Archive -Path stage/* -DestinationPath "OpenNR-$v-Windows.zip"
+          echo "ZIPNAME=OpenNR-$v-Windows.zip" >> $env:GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenNR-Windows
+          path: OpenNR-*-Windows.zip

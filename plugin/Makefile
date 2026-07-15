@@ -10,7 +10,7 @@ CXXFLAGS = -O3 -std=c++14 -fvisibility=hidden -I../ofx/include -I../ofx/Support/
 
 ifeq ($(UNAME_SYSTEM), Linux)
 	AMDAPP_PATH ?= /opt/AMDAPP
-	CXXFLAGS += -I${AMDAPP_PATH}/include -fPIC
+	CXXFLAGS += -I${AMDAPP_PATH}/include -fPIC -DHUSH_ENABLE_CUDA
 	CUDAPATH ?= /usr/local/cuda
 	NVCC = ${CUDAPATH}/bin/nvcc
 	NVCCFLAGS = --compiler-options="-fPIC" -I.

@@ -53,7 +53,8 @@
 #ifdef __APPLE__
 extern void RunMetalNR(void* p_CmdQ, int p_Width, int p_Height, const NRParams& p_Params,
                        const float* const p_Srcs[5], float* p_Dst);
-#else
+#endif
+#ifdef HUSH_ENABLE_CUDA
 extern void RunCudaNR(void* p_Stream, int p_Width, int p_Height, const NRParams& p_Params,
                       const float* const p_Srcs[5], float* p_Dst);
 #endif
@@ -95,7 +96,7 @@ public:
 
     virtual void processImagesCUDA()
     {
-#ifndef __APPLE__
+#ifdef HUSH_ENABLE_CUDA
         const OfxRectI& bounds = _srcImgs[2]->getBounds();
         const int width = bounds.x2 - bounds.x1;
         const int height = bounds.y2 - bounds.y1;
@@ -665,7 +666,7 @@ void OpenNRPluginFactory::describe(OFX::ImageEffectDescriptor& p_Desc)
     p_Desc.setSupportsMultipleClipPARs(kSupportsMultipleClipPARs);
 
     p_Desc.setSupportsOpenCLRender(true);
-#ifndef __APPLE__
+#ifdef HUSH_ENABLE_CUDA
     p_Desc.setSupportsCudaRender(true);
     p_Desc.setSupportsCudaStream(true);
 #endif

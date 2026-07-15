@@ -40,7 +40,15 @@ awk '/^static const char\* kKernelSource = R"MSL\(/{flag=1;next} /^\)MSL";/{flag
 xcrun -sdk macosx metal -c /tmp/opennr.metal -o /tmp/opennr.air
 
 # OpenCL kernel compile check: extract the R"CLC(...)CLC" block the same way
-# and build it with a small clCreateProgramWithSource/clBuildProgram harness.
+# and build it with a small clCreateProgramWithSource/clBuildProgram harness
+# (test/compile_opencl.cpp).
+
+# Describe smoke test — runs load/describe/describeInContext against the real
+# .ofx in a minimal OFX host. A describe-time crash is INVISIBLE in Resolve
+# (the plugin silently never appears), so run this after touching any param
+# definitions:
+c++ -O2 -std=c++14 -I../ofx/include test_describe.cpp -o test_describe
+./test_describe ../plugin/OpenNR.ofx.bundle/Contents/MacOS/OpenNR.ofx
 
 # Plugin build (universal arm64+x86_64, macOS 11.0 deployment target)
 cd ../plugin && make

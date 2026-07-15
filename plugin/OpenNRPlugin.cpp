@@ -325,7 +325,10 @@ private:
     // honors it, but a busy host may return nothing) — every failure path
     // returns what was gathered so the caller can message the user; this
     // never throws out of the action and never crashes.
-    int analyzeClipFrames(double p_Time, std::vector<nrcore::Stats>& p_Out)
+    // p_Flat (optional): v3.3 B4 — the flattest-patch scan runs on the
+    // first successfully fetched frame (the playhead frame)
+    int analyzeClipFrames(double p_Time, std::vector<nrcore::Stats>& p_Out,
+                          nranalyze::FlatPatch* p_Flat = nullptr)
     {
         try
         {
@@ -393,6 +396,8 @@ private:
                 }
                 nrcore::Stats st;
                 nrcore::estimateInput(buf.data(), partner, W, H, ap, st);
+                if (p_Flat && !p_Flat->valid)
+                    *p_Flat = nranalyze::findFlattestPatch(buf.data(), W, H, st);
                 p_Out.push_back(st);
             }
             return static_cast<int>(p_Out.size());
@@ -455,7 +460,8 @@ private:
     void runAutoSetup(double p_Time)
     {
         std::vector<nrcore::Stats> per;
-        if (analyzeClipFrames(p_Time, per) <= 0)
+        nranalyze::FlatPatch flat;
+        if (analyzeClipFrames(p_Time, per, &flat) <= 0)
         {
             analysisFailedMessage();
             return;
@@ -494,7 +500,7 @@ private:
         m_LockProfile->setValue(as.lockProfile != 0);
         int srcNow = 0;
         m_ProfileSource->getValue(srcNow);
-        m_AutoReport->setValue(nranalyze::formatAutoReport(agg, as, srcNow == 1 ? 1 : 0));
+        m_AutoReport->setValue(nranalyze::formatAutoReport(agg, as, srcNow == 1 ? 1 : 0, flat));
         endEditBlock();
         m_InAutoApply = false;
 

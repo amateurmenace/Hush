@@ -146,6 +146,77 @@ inline bool parseLockedProfile(const std::string& s, ClipAggregate& out)
 }
 
 // ---------------------------------------------------------------------------
+// v3.3 B4 — flattest-patch scan: where a sampling region SHOULD go
+// ---------------------------------------------------------------------------
+// The From Region profile is only as good as the rectangle the user drew —
+// on a flat area it is exact, on texture it overreads. Auto Setup scans a
+// coarse grid of candidate patches and scores each by structure content:
+// mean 3x3 local luma variance minus the expected noise variance at that
+// brightness (so dark noisy flats are not penalized for their noise). The
+// lowest-scoring centre is REPORTED in the Analysis line — never applied;
+// the user's rectangle is never moved.
+struct FlatPatch {
+    float cx = 0.5f, cy = 0.5f;   // normalized centre of the flattest patch
+    int   valid = 0;
+};
+
+inline FlatPatch findFlattestPatch(const float* rgba, int W, int H,
+                                   const nrcore::Stats& st)
+{
+    FlatPatch fp;
+    if (W < 64 || H < 64)
+        return fp;
+    // patch half-size matches the region default (regionSize 0.25)
+    const int half = std::max(8, static_cast<int>(0.125f * static_cast<float>(std::min(W, H))));
+    const int grid = 7;
+    float bestScore = 0.0f;
+    for (int gy = 0; gy < grid; ++gy) {
+        for (int gx = 0; gx < grid; ++gx) {
+            const float fx = 0.15f + 0.70f * static_cast<float>(gx) / (grid - 1);
+            const float fy = 0.15f + 0.70f * static_cast<float>(gy) / (grid - 1);
+            const int cx = static_cast<int>(fx * W);
+            const int cy = static_cast<int>(fy * H);
+            const int x0 = nrcore::clampi(cx - half, 1, W - 2);
+            const int x1 = nrcore::clampi(cx + half, 1, W - 2);
+            const int y0 = nrcore::clampi(cy - half, 1, H - 2);
+            const int y1 = nrcore::clampi(cy + half, 1, H - 2);
+            double score = 0.0;
+            int n = 0;
+            for (int y = y0; y < y1; y += 4) {
+                for (int x = x0; x < x1; x += 4) {
+                    float mean = 0.0f, m2 = 0.0f;
+                    float Yc = 0.0f, cb, cr;
+                    for (int dy = -1; dy <= 1; ++dy)
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            float Y;
+                            nrcore::sampleYCC(rgba, W, H, x + dx, y + dy, Y, cb, cr);
+                            if (dx == 0 && dy == 0) Yc = Y;
+                            mean += Y; m2 += Y * Y;
+                        }
+                    mean *= (1.0f / 9.0f);
+                    const float var = std::max(0.0f, m2 * (1.0f / 9.0f) - mean * mean);
+                    const int lb = nrcore::clampi(static_cast<int>(Yc * nrcore::kLumaBins),
+                                                  0, nrcore::kLumaBins - 1);
+                    const float sig = st.sy * st.gainY[lb];
+                    score += static_cast<double>(var) - static_cast<double>(sig) * sig;
+                    ++n;
+                }
+            }
+            if (n < 16)
+                continue;
+            score /= n;
+            if (!fp.valid || score < bestScore) {
+                bestScore = static_cast<float>(score);
+                fp.cx = fx;
+                fp.cy = fy;
+                fp.valid = 1;
+            }
+        }
+    }
+    return fp;
+}
+
+// ---------------------------------------------------------------------------
 // Auto Setup mapping policy — pure function, golden-tested
 // ---------------------------------------------------------------------------
 // Noise classes by luma sigma (fraction of full range):
@@ -278,10 +349,11 @@ inline AutoSettings mapAnalysisToSettings(const ClipAggregate& a)
 // Human-readable report for the Auto Setup status line
 // ---------------------------------------------------------------------------
 inline std::string formatAutoReport(const ClipAggregate& a, const AutoSettings& s,
-                                    int fromRegion = 0)
+                                    int fromRegion = 0,
+                                    const FlatPatch& flat = FlatPatch())
 {
     static const char* kClassName[4] = { "clean", "moderate noise", "noisy", "severe noise" };
-    char buf[256];
+    char buf[352];
     snprintf(buf, sizeof(buf),
              "Analyzed %d frame%s%s \xc2\xb7 noise %.1f%%Y / %.1f%%C (%s) \xc2\xb7 %s \xc2\xb7 profile locked",
              a.frames, a.frames == 1 ? "" : "s",
@@ -289,7 +361,18 @@ inline std::string formatAutoReport(const ClipAggregate& a, const AutoSettings& 
              a.sy * 100.0f, a.sc * 100.0f,
              kClassName[s.noiseClass],
              s.movingCamera ? "moving camera" : "steady camera");
-    return std::string(buf);
+    std::string out(buf);
+    // v3.3 B4: report-only — the user's rectangle is never moved
+    if (flat.valid) {
+        snprintf(buf, sizeof(buf),
+                 " \xc2\xb7 flattest patch at %d%%, %d%% \xe2\x80\x94 %s",
+                 static_cast<int>(flat.cx * 100.0f + 0.5f),
+                 static_cast<int>(flat.cy * 100.0f + 0.5f),
+                 fromRegion ? "compare with your region"
+                            : "a good spot for a sampling region");
+        out += buf;
+    }
+    return out;
 }
 
 } // namespace nranalyze

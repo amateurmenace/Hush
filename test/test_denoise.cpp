@@ -985,6 +985,47 @@ int main()
         check(rep.find("moving camera") != std::string::npos &&
               rep.find("%Y") != std::string::npos &&
               rep.find("profile locked") != std::string::npos, "auto report contains the key facts");
+        check(rep.find("flattest") == std::string::npos,
+              "auto report omits the flat patch when the scan did not run");
+    }
+
+    // =====================================================================
+    // v3.3 B4 — flattest-patch scan: report-only region suggestion
+    // =====================================================================
+    {
+        // flat left half + heavily textured right half, iid noise everywhere:
+        // the scan must land the patch centre in the left half
+        std::vector<float> img(static_cast<size_t>(W) * H * 4);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* px = &img[(static_cast<size_t>(y) * W + x) * 4];
+                float v = 0.42f;
+                if (x >= W / 2)
+                    v += 0.25f * nrcore::hashNoise(static_cast<uint32_t>(x / 3),
+                                                   static_cast<uint32_t>(y / 3), 1u, 0u);
+                px[0] = px[1] = px[2] = v;
+                px[3] = 1.0f;
+            }
+        addNoise(img, 0.03f, 71);
+        nrcore::Params ap;
+        nrcore::Stats st;
+        nrcore::estimateInput(img.data(), nullptr, W, H, ap, st);
+        const nranalyze::FlatPatch fp = nranalyze::findFlattestPatch(img.data(), W, H, st);
+        printf("v3.3 flat patch: found (%.0f%%, %.0f%%) on flat-left/texture-right\n",
+               fp.cx * 100.0f, fp.cy * 100.0f);
+        check(fp.valid == 1, "flat-patch scan finds a candidate");
+        check(fp.cx < 0.45f, "flat-patch scan avoids the textured half");
+
+        nranalyze::ClipAggregate agg;
+        agg.sy = agg.sc = 0.03f; agg.ty = agg.tc = 0.028f; agg.frames = 5;
+        const nranalyze::AutoSettings sRep = nranalyze::mapAnalysisToSettings(agg);
+        const std::string repF = nranalyze::formatAutoReport(agg, sRep, 0, fp);
+        const std::string repR = nranalyze::formatAutoReport(agg, sRep, 1, fp);
+        check(repF.find("flattest patch at") != std::string::npos &&
+              repF.find("sampling region") != std::string::npos,
+              "whole-frame report suggests where a region would go");
+        check(repR.find("compare with your region") != std::string::npos,
+              "from-region report only invites a comparison (never moves it)");
     }
 
     // =====================================================================

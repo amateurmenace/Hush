@@ -1086,6 +1086,18 @@ inline bool motionScopePixel(int x, int y, int W, int H,
 constant float kDirX[8] = { 1, 0, -1, 0, 0.7071f, -0.7071f, -0.7071f, 0.7071f };
 constant float kDirY[8] = { 0, 1, 0, -1, 0.7071f, 0.7071f, -0.7071f, -0.7071f };
 
+// v3.3 A2: the fine-band NLM loop reads (2R+1)^2 x 10 samples per pixel with
+// near-total overlap between neighbouring threads — each 16x16 threadgroup
+// cooperatively stages its tile of tmp (16 + 2(R+1) square: R window + 1 px
+// patch ring) into threadgroup memory as flat Y/Cb/Cr triples. Values are
+// the same edge-clamped samples sampleTmp returns, so the math is untouched.
+// Max footprint at R=10: 38*38*3 floats = 17.3 KB (< the 32 KB minimum).
+inline float3 tileAt(threadgroup const float* tile, int tileW, int lx, int ly)
+{
+    const int i = (ly * tileW + lx) * 3;
+    return float3(tile[i], tile[i + 1], tile[i + 2]);
+}
+
 kernel void SpatialNLMKernel(constant NRParams& p [[buffer(0)]],
                              constant int& W [[buffer(1)]],
                              constant int& H [[buffer(2)]],
@@ -1093,11 +1105,14 @@ kernel void SpatialNLMKernel(constant NRParams& p [[buffer(0)]],
                              const device float4* curr [[buffer(4)]],
                              const device uint* stats [[buffer(5)]],
                              device float4* dst [[buffer(6)]],
-                             uint2 id [[thread_position_in_grid]])
+                             threadgroup float* tile [[threadgroup(0)]],
+                             uint2 id [[thread_position_in_grid]],
+                             uint2 lid [[thread_position_in_threadgroup]],
+                             uint2 gid [[threadgroup_position_in_grid]])
 {
     const int x = int(id.x), y = int(id.y);
-    if (x >= W || y >= H)
-        return;
+    // NOTE: no early out-of-bounds return here — every thread (in-frame or
+    // not) must reach the cooperative tile load and its barrier below.
 
     const bool manual = (p.profileSource == 2) && (p.profileLocked == 0);
     // v3.3 lock fast path: locked input sigmas/gains come straight from the
@@ -1174,6 +1189,25 @@ kernel void SpatialNLMKernel(constant NRParams& p [[buffer(0)]],
     // v3.2 global blend — see nr_core.h
     const float gBlend = clamp(p.globalBlend, 0.0f, 1.0f);
 
+    // ---- v3.3 A2: cooperative tile stage (see tileAt above). runSpatial is
+    // uniform across the grid, so the branch and its barrier are legal; the
+    // out-of-bounds return must come only after the barrier. ----
+    const int tileW = 16 + 2 * (R + 1);
+    if (runSpatial) {
+        const int tx0 = int(gid.x) * 16 - (R + 1);
+        const int ty0 = int(gid.y) * 16 - (R + 1);
+        for (int i = int(lid.y) * 16 + int(lid.x); i < tileW * tileW; i += 256) {
+            const int tyy = i / tileW, txx = i - tyy * tileW;
+            const float4 v = tmp[clamp(ty0 + tyy, 0, H - 1) * W + clamp(tx0 + txx, 0, W - 1)];
+            tile[i * 3 + 0] = v.x; tile[i * 3 + 1] = v.y; tile[i * 3 + 2] = v.z;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (x >= W || y >= H)
+        return;
+    const int ltx = int(lid.x) + R + 1;   // this pixel in tile coords
+    const int lty = int(lid.y) + R + 1;
+
     const float4 tc = tmp[y * W + x];
     const int lb = clamp(int(tc.x * kLumaBins), 0, kLumaBins - 1);
     const float gainYv = locked ? clamp(p.lockGainY[lb], 0.6f, 2.2f)
@@ -1191,7 +1225,7 @@ kernel void SpatialNLMKernel(constant NRParams& p [[buffer(0)]],
             int i = 0;
             for (int dy = -1; dy <= 1; ++dy)
                 for (int dx = -1; dx <= 1; ++dx, ++i)
-                    pPatch[i] = sampleTmp(tmp, W, H, x + dx, y + dy).xyz;
+                    pPatch[i] = tileAt(tile, tileW, ltx + dx, lty + dy);
         }
 
         float mean = 0.0f, m2 = 0.0f;
@@ -1214,7 +1248,7 @@ kernel void SpatialNLMKernel(constant NRParams& p [[buffer(0)]],
             for (int dx = -R; dx <= R; ++dx) {
                 if (dx == 0 && dy == 0)
                     continue;
-                const float3 ts = sampleTmp(tmp, W, H, x + dx, y + dy).xyz;
+                const float3 ts = tileAt(tile, tileW, ltx + dx, lty + dy);
 
                 float dY2, dC2;
                 if (nlm) {
@@ -1222,7 +1256,7 @@ kernel void SpatialNLMKernel(constant NRParams& p [[buffer(0)]],
                     int i = 0;
                     for (int qy = -1; qy <= 1; ++qy) {
                         for (int qx = -1; qx <= 1; ++qx, ++i) {
-                            const float3 tq = sampleTmp(tmp, W, H, x + dx + qx, y + dy + qy).xyz;
+                            const float3 tq = tileAt(tile, tileW, ltx + dx + qx, lty + dy + qy);
                             const float3 e = pPatch[i] - tq;
                             dY2 += e.x * e.x;
                             dC2 += 0.5f * (e.y * e.y + e.z * e.z);
@@ -1707,6 +1741,11 @@ void RunMetalNR(void* p_CmdQ, int p_Width, int p_Height, const NRParams& p_Param
         [enc setBuffer:src[2] offset:0 atIndex:4];
         [enc setBuffer:res.stats offset:0 atIndex:5];
         [enc setBuffer:dst offset:0 atIndex:6];
+        // v3.3 A2: threadgroup tile for the fine-band loop — sized for the
+        // actual radius (same formula as the kernel; 17.3 KB at R=10 max)
+        const int Rsp = params.spatialRadius < 1 ? 1 : (params.spatialRadius > 10 ? 10 : params.spatialRadius);
+        const int tileW = 16 + 2 * (Rsp + 1);
+        [enc setThreadgroupMemoryLength:(3 * sizeof(float) * tileW * tileW) atIndex:0];
         [enc dispatchThreadgroups:gridFull threadsPerThreadgroup:tg];
     }
 

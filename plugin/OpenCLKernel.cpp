@@ -1056,14 +1056,28 @@ inline bool motionScopePixel(int x, int y, int W, int H,
     return true;
 }
 
+// v3.3 A2: the fine-band NLM loop reads (2R+1)^2 x 10 samples per pixel with
+// near-total overlap between neighbouring threads — each workgroup stages
+// its tile of tmp (side + 2(R+1) square: R window + 1 px patch ring) into
+// local memory as flat Y/Cb/Cr triples. Values are the same edge-clamped
+// samples sampleTmp returns, so the math is untouched. The workgroup side
+// comes from get_local_size (the host picks 16, falling back to 8 where the
+// device caps the workgroup or local memory) — Metal/CUDA hardcode 16.
+inline float3 tileAt(__local const float* tile, int tileW, int lx, int ly)
+{
+    const int i = (ly * tileW + lx) * 3;
+    return (float3)(tile[i], tile[i + 1], tile[i + 2]);
+}
+
 __kernel void SpatialNLMKernel(NRParams p, int W, int H,
                                __global const float4* tmp, __global const float4* curr,
-                               __global const uint* stats, __global float4* dst)
+                               __global const uint* stats, __global float4* dst,
+                               __local float* tile)
 {
     const int x = get_global_id(0);
     const int y = get_global_id(1);
-    if (x >= W || y >= H)
-        return;
+    // NOTE: no early out-of-bounds return here — every thread (in-frame or
+    // not) must reach the cooperative tile load and its barrier below.
 
     const int manual = (p.profileSource == 2) && (p.profileLocked == 0);
     // v3.3 lock fast path: locked input sigmas/gains come straight from the
@@ -1140,6 +1154,28 @@ __kernel void SpatialNLMKernel(NRParams p, int W, int H,
     // v3.2 global blend — see nr_core.h
     const float gBlend = clamp(p.globalBlend, 0.0f, 1.0f);
 
+    // ---- v3.3 A2: cooperative tile stage (see tileAt above). runSpatial is
+    // uniform across the grid, so the branch and its barrier are legal; the
+    // out-of-bounds return must come only after the barrier. ----
+    const int lsx = (int)get_local_size(0);
+    const int lsy = (int)get_local_size(1);
+    const int tileW = lsx + 2 * (R + 1);
+    const int tileH = lsy + 2 * (R + 1);
+    if (runSpatial) {
+        const int tx0 = (int)get_group_id(0) * lsx - (R + 1);
+        const int ty0 = (int)get_group_id(1) * lsy - (R + 1);
+        for (int i = (int)get_local_id(1) * lsx + (int)get_local_id(0); i < tileW * tileH; i += lsx * lsy) {
+            const int tyy = i / tileW, txx = i - tyy * tileW;
+            const float4 v = tmp[clamp(ty0 + tyy, 0, H - 1) * W + clamp(tx0 + txx, 0, W - 1)];
+            tile[i * 3 + 0] = v.x; tile[i * 3 + 1] = v.y; tile[i * 3 + 2] = v.z;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (x >= W || y >= H)
+        return;
+    const int ltx = (int)get_local_id(0) + R + 1;   // this pixel in tile coords
+    const int lty = (int)get_local_id(1) + R + 1;
+
     const float4 tc = tmp[y * W + x];
     const int lb = clamp((int)(tc.x * kLumaBins), 0, kLumaBins - 1);
     const float gainYv = locked ? clamp(p.lockGainY[lb], 0.6f, 2.2f)
@@ -1157,7 +1193,7 @@ __kernel void SpatialNLMKernel(NRParams p, int W, int H,
             int i = 0;
             for (int dy = -1; dy <= 1; ++dy)
                 for (int dx = -1; dx <= 1; ++dx, ++i)
-                    pPatch[i] = sampleTmp(tmp, W, H, x + dx, y + dy).xyz;
+                    pPatch[i] = tileAt(tile, tileW, ltx + dx, lty + dy);
         }
 
         float mean = 0.0f, m2 = 0.0f;
@@ -1180,7 +1216,7 @@ __kernel void SpatialNLMKernel(NRParams p, int W, int H,
             for (int dx = -R; dx <= R; ++dx) {
                 if (dx == 0 && dy == 0)
                     continue;
-                const float3 ts = sampleTmp(tmp, W, H, x + dx, y + dy).xyz;
+                const float3 ts = tileAt(tile, tileW, ltx + dx, lty + dy);
 
                 float dY2, dC2;
                 if (nlm) {
@@ -1188,7 +1224,7 @@ __kernel void SpatialNLMKernel(NRParams p, int W, int H,
                     int i = 0;
                     for (int qy = -1; qy <= 1; ++qy) {
                         for (int qx = -1; qx <= 1; ++qx, ++i) {
-                            const float3 tq = sampleTmp(tmp, W, H, x + dx + qx, y + dy + qy).xyz;
+                            const float3 tq = tileAt(tile, tileW, ltx + dx + qx, lty + dy + qy);
                             const float3 e = pPatch[i] - tq;
                             dY2 += e.x * e.x;
                             dC2 += 0.5f * (e.y * e.y + e.z * e.z);
@@ -1530,6 +1566,7 @@ struct QueueResources
     cl_mem tmp = nullptr;
     cl_mem stats = nullptr;
     int w = 0, h = 0;
+    size_t nlmWG = 16;   // v3.3 A2: NLM workgroup side (16, or 8 on capped devices)
 };
 
 } // namespace
@@ -1576,6 +1613,22 @@ void RunOpenCLNR(void* p_CmdQ, int p_Width, int p_Height, const NRParams& p_Para
             r.fin2 = clCreateKernel(program, "FinalizeResidualKernel", &error);
             r.nlm  = clCreateKernel(program, "SpatialNLMKernel", &error);
             CheckError(error, "Unable to create kernels");
+
+            // v3.3 A2: the tiled NLM kernel wants 16x16 workgroups; fall
+            // back to 8x8 where the device caps the kernel's workgroup size
+            // or has a small local memory (tile at wg 16, R 10 is 17.3 KB).
+            r.nlmWG = 16;
+            cl_device_id devId = NULL;
+            clGetCommandQueueInfo(cmdQ, CL_QUEUE_DEVICE, sizeof(cl_device_id), &devId, NULL);
+            if (devId && r.nlm)
+            {
+                size_t kwg = 0;
+                cl_ulong localMem = 0;
+                clGetKernelWorkGroupInfo(r.nlm, devId, CL_KERNEL_WORK_GROUP_SIZE, sizeof(size_t), &kwg, NULL);
+                clGetDeviceInfo(devId, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(cl_ulong), &localMem, NULL);
+                if (kwg < 256 || localMem < 20480)
+                    r.nlmWG = 8;
+            }
         }
 
         if (!r.tmp || r.w != p_Width || r.h != p_Height)
@@ -1689,8 +1742,19 @@ void RunOpenCLNR(void* p_CmdQ, int p_Width, int p_Height, const NRParams& p_Para
         error |= clSetKernelArg(res.nlm, c++, sizeof(cl_mem), &p_Srcs[2]);
         error |= clSetKernelArg(res.nlm, c++, sizeof(cl_mem), &res.stats);
         error |= clSetKernelArg(res.nlm, c++, sizeof(cl_mem), &p_Dst);
+        // v3.3 A2: local-memory tile for the fine-band loop — sized for the
+        // actual radius and the chosen workgroup (same formula as the kernel)
+        const int Rsp = params.spatialRadius < 1 ? 1 : (params.spatialRadius > 10 ? 10 : params.spatialRadius);
+        const size_t wg = res.nlmWG;
+        const size_t tileW = wg + 2 * (static_cast<size_t>(Rsp) + 1);
+        error |= clSetKernelArg(res.nlm, c++, 3 * sizeof(float) * tileW * tileW, NULL);
         CheckError(error, "nlm args");
-        error = clEnqueueNDRangeKernel(cmdQ, res.nlm, 2, NULL, global, NULL, 0, NULL, NULL);
+        // the tile ties threads to workgroups, so the workgroup size must be
+        // explicit and the global size rounded up (the kernel guards overrun)
+        size_t localNlm[2]  = { wg, wg };
+        size_t globalNlm[2] = { (static_cast<size_t>(W) + wg - 1) / wg * wg,
+                                (static_cast<size_t>(H) + wg - 1) / wg * wg };
+        error = clEnqueueNDRangeKernel(cmdQ, res.nlm, 2, NULL, globalNlm, localNlm, 0, NULL, NULL);
         CheckError(error, "nlm enqueue");
     }
 }

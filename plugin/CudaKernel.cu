@@ -1020,14 +1020,28 @@ __device__ inline bool motionScopePixel(int x, int y, int W, int H,
 }
 
 // ---------------------------------------------------------------------------
+// v3.3 A2: the fine-band NLM loop reads (2R+1)^2 x 10 samples per pixel with
+// near-total overlap between neighbouring threads — each 16x16 block stages
+// its tile of tmp (16 + 2(R+1) square: R window + 1 px patch ring) into
+// shared memory as flat Y/Cb/Cr triples. Values are the same edge-clamped
+// samples sampleTmp returns, so the math is untouched. Max footprint at
+// R=10: 38*38*3 floats = 17.3 KB (< the 48 KB default shared allocation).
+__device__ inline void tileAt(const float* tile, int tileW, int lx, int ly,
+                              float& Y, float& Cb, float& Cr)
+{
+    const int i = (ly * tileW + lx) * 3;
+    Y = tile[i]; Cb = tile[i + 1]; Cr = tile[i + 2];
+}
+
 __global__ void SpatialNLMKernel(NRParams p, int W, int H,
                                  const float4* tmp, const float4* curr,
                                  const unsigned int* stats, float4* dst)
 {
+    extern __shared__ float tile[];
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= W || y >= H)
-        return;
+    // NOTE: no early out-of-bounds return here — every thread (in-frame or
+    // not) must reach the cooperative tile load and its barrier below.
 
     const bool manual = (p.profileSource == 2) && (p.profileLocked == 0);
     // v3.3 lock fast path: locked input sigmas/gains come straight from the
@@ -1105,6 +1119,25 @@ __global__ void SpatialNLMKernel(NRParams p, int W, int H,
     // v3.2 global blend — see nr_core.h
     const float gBlend = clampf(p.globalBlend, 0.0f, 1.0f);
 
+    // ---- v3.3 A2: cooperative tile stage (see tileAt above). runSpatial is
+    // uniform across the grid, so the branch and its barrier are legal; the
+    // out-of-bounds return must come only after the barrier. ----
+    const int tileW = 16 + 2 * (R + 1);
+    if (runSpatial) {
+        const int tx0 = (int)blockIdx.x * 16 - (R + 1);
+        const int ty0 = (int)blockIdx.y * 16 - (R + 1);
+        for (int i = (int)threadIdx.y * 16 + (int)threadIdx.x; i < tileW * tileW; i += 256) {
+            const int tyy = i / tileW, txx = i - tyy * tileW;
+            const float4 v = tmp[clampi(ty0 + tyy, 0, H - 1) * W + clampi(tx0 + txx, 0, W - 1)];
+            tile[i * 3 + 0] = v.x; tile[i * 3 + 1] = v.y; tile[i * 3 + 2] = v.z;
+        }
+        __syncthreads();
+    }
+    if (x >= W || y >= H)
+        return;
+    const int ltx = (int)threadIdx.x + R + 1;   // this pixel in tile coords
+    const int lty = (int)threadIdx.y + R + 1;
+
     const float4 tc = tmp[y * W + x];
     const int lb = clampi((int)(tc.x * kLumaBins), 0, kLumaBins - 1);
     const float gainYv = locked ? clampf(p.lockGainY[lb], 0.6f, 2.2f)
@@ -1121,10 +1154,8 @@ __global__ void SpatialNLMKernel(NRParams p, int W, int H,
         {
             int i = 0;
             for (int dy = -1; dy <= 1; ++dy)
-                for (int dx = -1; dx <= 1; ++dx, ++i) {
-                    const float4 v = sampleTmp(tmp, W, H, x + dx, y + dy);
-                    pY[i] = v.x; pCb[i] = v.y; pCr[i] = v.z;
-                }
+                for (int dx = -1; dx <= 1; ++dx, ++i)
+                    tileAt(tile, tileW, ltx + dx, lty + dy, pY[i], pCb[i], pCr[i]);
         }
 
         float mean = 0.0f, m2 = 0.0f;
@@ -1147,7 +1178,8 @@ __global__ void SpatialNLMKernel(NRParams p, int W, int H,
             for (int dx = -R; dx <= R; ++dx) {
                 if (dx == 0 && dy == 0)
                     continue;
-                const float4 ts4 = sampleTmp(tmp, W, H, x + dx, y + dy);
+                float tsY, tsCb, tsCr;
+                tileAt(tile, tileW, ltx + dx, lty + dy, tsY, tsCb, tsCr);
 
                 float dY2, dC2;
                 if (nlm) {
@@ -1155,10 +1187,11 @@ __global__ void SpatialNLMKernel(NRParams p, int W, int H,
                     int i = 0;
                     for (int qy = -1; qy <= 1; ++qy) {
                         for (int qx = -1; qx <= 1; ++qx, ++i) {
-                            const float4 tq = sampleTmp(tmp, W, H, x + dx + qx, y + dy + qy);
-                            const float eY = pY[i] - tq.x;
-                            const float eCb = pCb[i] - tq.y;
-                            const float eCr = pCr[i] - tq.z;
+                            float tqY, tqCb, tqCr;
+                            tileAt(tile, tileW, ltx + dx + qx, lty + dy + qy, tqY, tqCb, tqCr);
+                            const float eY = pY[i] - tqY;
+                            const float eCb = pCb[i] - tqCb;
+                            const float eCr = pCr[i] - tqCr;
                             dY2 += eY * eY;
                             dC2 += 0.5f * (eCb * eCb + eCr * eCr);
                         }
@@ -1166,9 +1199,9 @@ __global__ void SpatialNLMKernel(NRParams p, int W, int H,
                     dY2 *= (1.0f / 9.0f);
                     dC2 *= (1.0f / 9.0f);
                 } else {
-                    const float eY = tc.x - ts4.x;
-                    const float eCb = tc.y - ts4.y;
-                    const float eCr = tc.z - ts4.z;
+                    const float eY = tc.x - tsY;
+                    const float eCb = tc.y - tsCb;
+                    const float eCr = tc.z - tsCr;
                     dY2 = eY * eY;
                     dC2 = 0.5f * (eCb * eCb + eCr * eCr);
                 }
@@ -1184,9 +1217,9 @@ __global__ void SpatialNLMKernel(NRParams p, int W, int H,
                     wC *= fall;
                 }
 
-                accY  += wY * ts4.x;
-                accCb += wC * ts4.y;
-                accCr += wC * ts4.z;
+                accY  += wY * tsY;
+                accCb += wC * tsCb;
+                accCr += wC * tsCr;
                 sumWY += wY;
                 sumWC += wC;
                 wYmax = fmaxf(wYmax, wY);
@@ -1587,6 +1620,11 @@ void RunCudaNR(void* p_Stream, int p_Width, int p_Height, const NRParams& p_Para
         FinalizeResidualKernel<<<1, 1, 0, stream>>>(params, res.stats);
     }
 
-    SpatialNLMKernel<<<blocks, threads, 0, stream>>>(params, p_Width, p_Height,
-                                                     res.tmp, srcs[2], res.stats, dst);
+    // v3.3 A2: shared-memory tile for the fine-band loop — sized for the
+    // actual radius (same formula as the kernel; 17.3 KB at R=10 max)
+    const int Rsp = params.spatialRadius < 1 ? 1 : (params.spatialRadius > 10 ? 10 : params.spatialRadius);
+    const int tileW = 16 + 2 * (Rsp + 1);
+    const size_t tileBytes = 3 * sizeof(float) * tileW * tileW;
+    SpatialNLMKernel<<<blocks, threads, tileBytes, stream>>>(params, p_Width, p_Height,
+                                                             res.tmp, srcs[2], res.stats, dst);
 }

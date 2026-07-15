@@ -296,11 +296,22 @@ static inline void blockMean4Tmp(const float* tmp, int W, int H, int x, int y,
 static const float kDirX[8] = { 1, 0, -1, 0, 0.7071f, -0.7071f, -0.7071f, 0.7071f };
 static const float kDirY[8] = { 0, 1, 0, -1, 0.7071f, 0.7071f, -0.7071f, -0.7071f };
 
-// v3 shift-search candidate offsets: centre first, then +/-1 and +/-2 on each
-// axis. Centre-first order + the 1% acceptance margin in temporalMerge keep
-// the selection stable (a shift must be clearly better to win).
-static const int kOffX[9] = { 0, 1, -1, 0, 0, 2, -2, 0, 0 };
-static const int kOffY[9] = { 0, 0, 0, 1, -1, 0, 0, 2, -2 };
+// v3.3 B1 hierarchical shift search. Coarse level: step-4 nodes covering a
+// +/-4 box plus the +/-8 axes and corners, scored on 2x2 block means (blocks
+// low-pass the comparison so a 4 px step sees large-scale structure instead
+// of aliasing on fine texture). Refine level: a converging +/-1 box walk (up
+// to 2 steps) around the winner — every shift within Chebyshev distance 2 of
+// a node is recovered exactly, i.e. all of |shift| <= 6 plus the 8 px axes/
+// corners (effective reach ~6-8 px). The walk also starts from the unshifted
+// match when the coarse level finds nothing, so the old +/-1 and +/-2
+// slow-drift shifts stay reachable; two steps (not more) keeps the noisy-
+// score selection bias on static/drift footage at the v3.2 level. The 1%
+// acceptance margin guards every step (a shift must be clearly better to
+// win), exactly as the v3 single-level search.
+static const int kCoarseX[16] = { 4, -4, 0,  0, 4, -4,  4, -4, 8, -8, 0,  0, 8, -8,  8, -8 };
+static const int kCoarseY[16] = { 0,  0, 4, -4, 4,  4, -4, -4, 0,  0, 8, -8, 8,  8, -8, -8 };
+static const int kRefX[8] = { 1, -1, 0,  0, 1, -1,  1, -1 };
+static const int kRefY[8] = { 0,  0, 1, -1, 1,  1, -1, -1 };
 
 // Mean |3x3 patch difference| of neighbour frame f shifted by (ox,oy) against
 // the current frame's patch (cy9/ccb9/ccr9); also returns the SIGNED mean
@@ -328,6 +339,25 @@ static inline void patchDiff(const float* f, int W, int H, int x, int y,
     dY *= (1.0f / 9.0f);
     dC *= (1.0f / 9.0f);
     sdY *= (1.0f / 9.0f);
+}
+
+// v3.3 B1: coarse matching score for the hierarchical shift search — mean
+// |2x2-block-mean luma difference| of a 3x3 stride-2 block patch (6x6 px
+// support) of neighbour frame f shifted by (ox,oy), against the centre's
+// own block patch cb9. Luma only: selection follows the luma match exactly
+// like the refine level.
+static inline float coarseDiff(const float* f, int W, int H, int x, int y,
+                               int ox, int oy, const float* cb9)
+{
+    float d = 0.0f;
+    int i = 0;
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx, ++i) {
+            float bY, bCb, bCr;
+            blockMeanYCC(f, W, H, x + ox + dx * 2, y + oy + dy * 2, bY, bCb, bCr);
+            d += std::fabs(bY - cb9[i]);
+        }
+    return d * (1.0f / 9.0f);
 }
 
 // Integer hash noise (identical across CPU/Metal/CUDA/OpenCL: pure uint32 math)
@@ -650,6 +680,11 @@ inline void temporalMerge(const float* const frames[5], int W, int H,
             float accY = cy9[4], accCb = ccb9[4], accCr = ccr9[4];
             float sumWY = 1.0f, sumWY2 = 1.0f, sumWC = 1.0f;
 
+            // v3.3 B1: the centre's coarse block patch for the hierarchical
+            // search — built lazily once per pixel, shared by all neighbours
+            float cb9[9];
+            bool haveCb9 = false;
+
             for (int k = 2 - reach; k <= 2 + reach; ++k) {
                 if (k == 2)
                     continue;
@@ -659,26 +694,84 @@ inline void temporalMerge(const float* const frames[5], int W, int H,
                 patchDiff(f, W, H, x, y, 0, 0, cy9, ccb9, ccr9,
                           dY, dC, sdY, fy9c, fcb9c, fcr9c);
 
-                // Shift search: try the 8 shifted candidates and keep the
-                // best luma match. A candidate must beat the running best by
-                // 1% so the unshifted patch wins ties and near-ties.
+                // v3.3 B1 hierarchical shift search (see kCoarseX above).
+                // Every acceptance needs the 1% margin so the unshifted
+                // patch wins ties and near-ties, and any shifted winner
+                // keeps the tightened roll-off:
+                // a shifted patch must match like a static one to be
+                // trusted: the knee START stays (true rematches sit at
+                // pure-noise diff levels and keep weight 1) but the
+                // roll-off is ~1.7x steeper, so partial matches on periodic
+                // texture — motion beyond the search reach — cannot blend
+                // misaligned detail. Ghost Guard gates the WINNER's signed
+                // mean, wherever the search lands.
                 float shiftTight = 1.0f;
                 if (track && dY > searchThresh) {
-                    for (int c = 1; c < 9; ++c) {
+                    int wx = 0, wy = 0;
+                    // The coarse level runs only when the unshifted match is
+                    // FULLY outside the knee (dY > hiY): its weight is
+                    // already zero, so there is nothing to lose by hunting
+                    // far — and static/drift pixels, whose noise crosses
+                    // searchThresh routinely but hiY rarely, never pay the
+                    // 16-node block-mean sweep (measured: gating here
+                    // returned the static-scene fps to the v3.2 level).
+                    if (dY > hiY) {
+                        if (!haveCb9) {
+                            int i = 0;
+                            for (int dy = -1; dy <= 1; ++dy)
+                                for (int dx = -1; dx <= 1; ++dx, ++i) {
+                                    float bCb, bCr;
+                                    blockMeanYCC(frames[2], W, H, x + dx * 2, y + dy * 2,
+                                                 cb9[i], bCb, bCr);
+                                }
+                            haveCb9 = true;
+                        }
+                        // coarse level: best step-4 node on block means
+                        float bestC = coarseDiff(f, W, H, x, y, kCoarseX[0], kCoarseY[0], cb9);
+                        int bestOx = kCoarseX[0], bestOy = kCoarseY[0];
+                        for (int c = 1; c < 16; ++c) {
+                            const float d = coarseDiff(f, W, H, x, y, kCoarseX[c], kCoarseY[c], cb9);
+                            if (d < bestC) { bestC = d; bestOx = kCoarseX[c]; bestOy = kCoarseY[c]; }
+                        }
+                        // The coarse winner must survive the real patch
+                        // metric — by 10%, much stricter than the walk's 1%:
+                        // a genuine 4+ px re-aim scores several times better
+                        // than the misaligned unshifted patch and clears any
+                        // margin, while small flukes on noisy structure (the
+                        // sub-pixel-drift regime, where no step-4 node is
+                        // right) must not yank the match 4 px away. Measured
+                        // on the drift regression: 1% lost 0.07 dB and 3%
+                        // still 0.06 dB to exactly these jumps; 10% keeps
+                        // the v3.2 number with the pan gains untouched.
                         float dY2, dC2, sd2, fy2, fcb2, fcr2;
-                        patchDiff(f, W, H, x, y, kOffX[c], kOffY[c],
+                        patchDiff(f, W, H, x, y, bestOx, bestOy,
                                   cy9, ccb9, ccr9, dY2, dC2, sd2, fy2, fcb2, fcr2);
-                        if (dY2 < dY * 0.99f) {
+                        if (dY2 < dY * 0.90f) {
                             dY = dY2; dC = dC2; sdY = sd2;
                             fy9c = fy2; fcb9c = fcb2; fcr9c = fcr2;
-                            // a shifted patch must match like a static one to
-                            // be trusted: the knee START stays (true rematches
-                            // sit at pure-noise diff levels and keep weight 1)
-                            // but the roll-off is ~1.7x steeper, so partial
-                            // matches on periodic texture — motion beyond the
-                            // search reach — cannot blend misaligned detail.
+                            wx = bestOx; wy = bestOy;
                             shiftTight = 1.0f / 0.6f;
                         }
+                    }
+                    // refine level: converging +/-1 walk around the winner
+                    // (from the unshifted match when the coarse level failed)
+                    for (int it = 0; it < 2; ++it) {
+                        int nwx = wx, nwy = wy;
+                        for (int c = 0; c < 8; ++c) {
+                            const int tx = wx + kRefX[c], ty = wy + kRefY[c];
+                            float dY2, dC2, sd2, fy2, fcb2, fcr2;
+                            patchDiff(f, W, H, x, y, tx, ty,
+                                      cy9, ccb9, ccr9, dY2, dC2, sd2, fy2, fcb2, fcr2);
+                            if (dY2 < dY * 0.99f) {
+                                dY = dY2; dC = dC2; sdY = sd2;
+                                fy9c = fy2; fcb9c = fcb2; fcr9c = fcr2;
+                                nwx = tx; nwy = ty;
+                                shiftTight = 1.0f / 0.6f;
+                            }
+                        }
+                        if (nwx == wx && nwy == wy)
+                            break;
+                        wx = nwx; wy = nwy;
                     }
                 }
 

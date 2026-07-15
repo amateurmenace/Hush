@@ -209,9 +209,12 @@ inline float3 blockMean4Tmp(const device float4* tmp, int W, int H, int x, int y
     return acc * 0.0625f;
 }
 
-// v3 shift-search candidate offsets: centre first, then +/-1 and +/-2
-constant int kOffX[9] = { 0, 1, -1, 0, 0, 2, -2, 0, 0 };
-constant int kOffY[9] = { 0, 0, 0, 1, -1, 0, 0, 2, -2 };
+// v3.3 B1 hierarchical shift search offsets — see nr_core.h for the grid
+// design, margins and the drift-bias rationale
+constant int kCoarseX[16] = { 4, -4, 0,  0, 4, -4,  4, -4, 8, -8, 0,  0, 8, -8,  8, -8 };
+constant int kCoarseY[16] = { 0,  0, 4, -4, 4,  4, -4, -4, 0,  0, 8, -8, 8,  8, -8, -8 };
+constant int kRefX[8] = { 1, -1, 0,  0, 1, -1,  1, -1 };
+constant int kRefY[8] = { 0,  0, 1, -1, 1,  1, -1, -1 };
 
 // Mean |3x3 patch difference| of neighbour frame f shifted by (ox,oy) against
 // the current frame's patch; also returns the SIGNED mean luma difference
@@ -235,6 +238,20 @@ inline void patchDiff(const device float4* f, int W, int H, int x, int y,
     dY *= (1.0f / 9.0f);
     dC *= (1.0f / 9.0f);
     sdY *= (1.0f / 9.0f);
+}
+
+// v3.3 B1: coarse matching score for the hierarchical shift search — mean
+// |2x2-block-mean luma difference| of a 3x3 stride-2 block patch (6x6 px
+// support); see nr_core.h.
+inline float coarseDiff(const device float4* f, int W, int H, int x, int y,
+                        int ox, int oy, thread const float* cb9)
+{
+    float d = 0.0f;
+    int i = 0;
+    for (int dy = -1; dy <= 1; ++dy)
+        for (int dx = -1; dx <= 1; ++dx, ++i)
+            d += fabs(blockMeanYCC(f, W, H, x + ox + dx * 2, y + oy + dy * 2).x - cb9[i]);
+    return d * (1.0f / 9.0f);
 }
 
 inline float hashNoise(uint ix, uint iy, uint f, uint ch)
@@ -560,6 +577,11 @@ kernel void TemporalKernel(constant NRParams& p [[buffer(0)]],
     float accY = c9[4].x, accCb = c9[4].y, accCr = c9[4].z;
     float sumWY = 1.0f, sumWY2 = 1.0f, sumWC = 1.0f;
 
+    // v3.3 B1: the centre's coarse block patch for the hierarchical search —
+    // built lazily once per pixel, shared by all neighbours
+    float cb9[9];
+    bool haveCb9 = false;
+
     for (int k = 2 - reach; k <= 2 + reach; ++k) {
         if (k == 2)
             continue;
@@ -569,18 +591,57 @@ kernel void TemporalKernel(constant NRParams& p [[buffer(0)]],
         float3 fc;
         patchDiff(f, W, H, x, y, 0, 0, c9, dY, dC, sdY, fc);
 
-        // v3 shift search — see nr_core.h for the acceptance margin and the
-        // tightened roll-off for shifted winners
+        // v3.3 B1 hierarchical shift search — see nr_core.h for the grid,
+        // the margins and the drift-bias rationale
         float shiftTight = 1.0f;
         if (track && dY > searchThresh) {
-            for (int c = 1; c < 9; ++c) {
+            int wx = 0, wy = 0;
+            // coarse level only when the unshifted match is FULLY outside
+            // the knee (weight already zero — nothing to lose by hunting
+            // far); static/drift noise crosses searchThresh routinely but
+            // hiY rarely, so it never pays the 16-node sweep. See nr_core.h.
+            if (dY > hiY) {
+                if (!haveCb9) {
+                    int i2 = 0;
+                    for (int dy = -1; dy <= 1; ++dy)
+                        for (int dx = -1; dx <= 1; ++dx, ++i2)
+                            cb9[i2] = blockMeanYCC(f2, W, H, x + dx * 2, y + dy * 2).x;
+                    haveCb9 = true;
+                }
+                // coarse level: best step-4 node on block means
+                float bestC = coarseDiff(f, W, H, x, y, kCoarseX[0], kCoarseY[0], cb9);
+                int bestOx = kCoarseX[0], bestOy = kCoarseY[0];
+                for (int c = 1; c < 16; ++c) {
+                    const float d = coarseDiff(f, W, H, x, y, kCoarseX[c], kCoarseY[c], cb9);
+                    if (d < bestC) { bestC = d; bestOx = kCoarseX[c]; bestOy = kCoarseY[c]; }
+                }
+                // the coarse winner must survive the real patch metric by 10%
                 float dY2, dC2, sd2;
                 float3 fc2;
-                patchDiff(f, W, H, x, y, kOffX[c], kOffY[c], c9, dY2, dC2, sd2, fc2);
-                if (dY2 < dY * 0.99f) {
+                patchDiff(f, W, H, x, y, bestOx, bestOy, c9, dY2, dC2, sd2, fc2);
+                if (dY2 < dY * 0.90f) {
                     dY = dY2; dC = dC2; sdY = sd2; fc = fc2;
+                    wx = bestOx; wy = bestOy;
                     shiftTight = 1.0f / 0.6f;
                 }
+            }
+            // refine level: converging +/-1 walk around the winner
+            for (int it = 0; it < 2; ++it) {
+                int nwx = wx, nwy = wy;
+                for (int c = 0; c < 8; ++c) {
+                    const int tx = wx + kRefX[c], ty = wy + kRefY[c];
+                    float dY2, dC2, sd2;
+                    float3 fc2;
+                    patchDiff(f, W, H, x, y, tx, ty, c9, dY2, dC2, sd2, fc2);
+                    if (dY2 < dY * 0.99f) {
+                        dY = dY2; dC = dC2; sdY = sd2; fc = fc2;
+                        nwx = tx; nwy = ty;
+                        shiftTight = 1.0f / 0.6f;
+                    }
+                }
+                if (nwx == wx && nwy == wy)
+                    break;
+                wx = nwx; wy = nwy;
             }
         }
 

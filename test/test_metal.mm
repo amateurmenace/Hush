@@ -21,7 +21,7 @@ extern void RunMetalNR(void* p_CmdQ, int p_Width, int p_Height, const NRParams& 
 static const int W = 512;
 static const int H = 288;
 
-static void makeFrame(std::vector<float>& img, int k, uint32_t seed)
+static void makeFrame(std::vector<float>& img, int k, uint32_t seed, float panPx = 2.0f)
 {
     img.resize(static_cast<size_t>(W) * H * 4);
     std::mt19937 rng(seed);
@@ -29,7 +29,7 @@ static void makeFrame(std::vector<float>& img, int k, uint32_t seed)
     for (int y = 0; y < H; ++y) {
         for (int x = 0; x < W; ++x) {
             float* p = &img[(static_cast<size_t>(y) * W + x) * 4];
-            const float fx = x + k * 2.0f;
+            const float fx = x + k * panPx;
             float r = 0.2f + 0.4f * (fx / W);
             float g = 0.3f + 0.2f * (static_cast<float>(y) / H);
             float b = 0.25f + 0.3f * (fx / W);
@@ -110,11 +110,12 @@ static void toCpuParams(const NRParams& gp, nrcore::Params& cp)
 // per-pixel diff, but bounded to a handful of panel pixels. Assert a tiny
 // mean and a tiny absolute count instead of a strict max.
 static int compareRun(id<MTLCommandQueue> queue, const NRParams& gp, const char* label,
-                      bool sparseOK = false, bool injectImpulses = false, bool hudOK = false)
+                      bool sparseOK = false, bool injectImpulses = false, bool hudOK = false,
+                      float panPx = 2.0f)
 {
     std::vector<std::vector<float>> frames(5);
     for (int k = 0; k < 5; ++k)
-        makeFrame(frames[k], k - 2, 100 + k);
+        makeFrame(frames[k], k - 2, 100 + k, panPx);
     if (injectImpulses) {
         std::mt19937 rng(7);
         std::uniform_int_distribution<int> RX(8, W - 9), RY(8, H - 9);
@@ -341,6 +342,14 @@ int main()
 
     NRParams y4 = v6; y4.profileSource = 1; y4.regionCX = 0.3f; y4.regionCY = 0.4f;
     failures += compareRun(queue, y4, "v3.3 locked fast path, region source");
+
+    // B1 hierarchical search: a 5 px/frame pan exercises the coarse step-4
+    // level + refine walk (the 2 px cases above only reach the walk)
+    NRParams y5 = p; y5.motionTracking = 1;
+    failures += compareRun(queue, y5, "v3.3 tracking, 5px pan (coarse)", true, false, false, 5.0f);
+
+    NRParams y6 = y5; y6.temporalFrames = 3; y6.ghostGuard = 0;
+    failures += compareRun(queue, y6, "v3.3 tracking 5px, 3f, no guard", true, false, false, 5.0f);
 
     printf(failures == 0 ? "ALL GPU PARITY CHECKS PASSED\n" : "%d GPU PARITY CHECK(S) FAILED\n", failures);
     return failures == 0 ? 0 : 1;

@@ -596,6 +596,31 @@ int main()
         CaseResult stOn  = runCase(0.05f, 0.0f, 0.0f, NOISE_IID, pOn);
         printf("static: tracking off %5.2f dB, on %5.2f dB\n", stOff.after, stOn.after);
         check(stOn.after > stOff.after - 0.15, "tracking does not regress static footage");
+
+        // ---- v3.3 B1: hierarchical search (coarse step 4 + refine walk) ----
+        // fast pans far beyond the old +/-2 px reach must keep their
+        // temporal averaging: 4 and 6 px/frame each beat spatial-only by
+        // >= 2 dB (the +/-2-frame neighbours sit at 8/12 px — out of reach,
+        // correctly gated off; the +/-1 neighbours re-aim exactly).
+        CaseResult pan4Sp = runCase(0.05f, 4.0f, 0.0f, NOISE_IID, pSp);
+        CaseResult pan4On = runCase(0.05f, 4.0f, 0.0f, NOISE_IID, pOn);
+        CaseResult pan6Sp = runCase(0.05f, 6.0f, 0.0f, NOISE_IID, pSp);
+        CaseResult pan6On = runCase(0.05f, 6.0f, 0.0f, NOISE_IID, pOn);
+        printf("v3.3 pan 4px: spatial-only %5.2f, tracking %5.2f dB | pan 6px: %5.2f, %5.2f dB\n",
+               pan4Sp.after, pan4On.after, pan6Sp.after, pan6On.after);
+        check(pan4On.after >= pan4Sp.after + 2.0, "pan 4px: tracking beats spatial-only by >= 2 dB");
+        check(pan6On.after >= pan6Sp.after + 2.0, "pan 6px: tracking beats spatial-only by >= 2 dB");
+        // a diagonal pan must be recovered too (full coarse box + refine)
+        CaseResult panDSp = runCase(0.05f, 4.0f, 3.0f, NOISE_IID, pSp);
+        CaseResult panDOn = runCase(0.05f, 4.0f, 3.0f, NOISE_IID, pOn);
+        printf("v3.3 diagonal pan (4,3)px: spatial-only %5.2f, tracking %5.2f dB\n",
+               panDSp.after, panDOn.after);
+        check(panDOn.after >= panDSp.after + 2.0, "diagonal pan: tracking beats spatial-only by >= 2 dB");
+        // regressions against the v3.2 single-level numbers (pinned from the
+        // v3.2.0 build on this scene): static and slow drift may not lose
+        // more than 0.05 dB to the bigger candidate set
+        check(stOn.after > 40.93 - 0.05, "v3.3 static with tracking holds the v3.2 number (40.93)");
+        check(drOn.after > 38.54 - 0.05, "v3.3 slow drift holds the v3.2 number (38.54)");
     }
 
     // =====================================================================

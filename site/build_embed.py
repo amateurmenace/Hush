@@ -16,7 +16,9 @@ t = open(os.path.join(here, "index.template.html")).read()
 
 # --- images -> hosted URLs
 for tok, name in [("B64_AFTER","after.jpg"), ("B64_BEFORE","before.jpg"),
-                  ("B64_HUD","hud.jpg"), ("B64_SNR","snr.jpg")]:
+                  ("B64_SCM","scope-measure.jpg"), ("B64_SCMO","scope-motion.jpg"),
+                  ("B64_SCEQ","scope-eq.jpg"), ("B64_SCSNR","scope-snr.jpg"),
+                  ("B64_WM","wm-logo.png")]:
     t = t.replace(f"%%{tok}%%", f"{PAGES}/{name}")
 
 # --- pull out fonts, style, body
@@ -61,7 +63,8 @@ style = prefix_selectors(style)
 
 # --- prefix ids referenced from JS (html + scripts together)
 ids = ["testcard","noise","hush","true","meas","verdict",
-       "wipe","wipeTop","wipeHandle","pipe","pipeText","chart"]
+       "wipe","wipeTop","wipeHandle","pipe","pipeText","pipeHint","chart",
+       "scopeTabs","scopeImg","scopeCap","scopeChk","scopeStep","scopeHint"]
 for x in ids:
     body = body.replace(f'id="{x}"', f'id="hush-{x}"')
     body = body.replace(f"getElementById('{x}')", f"getElementById('hush-{x}')")

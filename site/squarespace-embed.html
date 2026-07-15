@@ -144,9 +144,55 @@
 #hush-embed ol.install li { counter-increment: st; position: relative; padding: 0 0 20px 56px; }
 #hush-embed ol.install li::before { content: counter(st); position: absolute; left: 0; top: -2px; width: 36px; height: 36px; border-radius: 50%; background: var(--card); border: 2px solid var(--green-br); color: var(--green); font: 700 16px var(--mono); display: flex; align-items: center; justify-content: center; }
 #hush-embed a { color: var(--green-br); }
+#hush-embed /* pro tips */
+  .tips { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 18px; }
+
+  @media (max-width: 760px) {#hush-embed .tips { grid-template-columns: 1fr; }
+ }#hush-embed .tipcard { background: var(--card); border: 1px solid var(--border); border-radius: var(--r-md); padding: 18px 20px; }
+#hush-embed .tipcard .tn { font: 700 11px var(--mono); letter-spacing: .12em; color: var(--amber); text-transform: uppercase; display: block; margin-bottom: 8px; }
+#hush-embed .tipcard b { color: var(--green); font-family: "Space Grotesk"; }
+#hush-embed .tipcard p { font-size: 14.5px; margin: 6px 0 0; }
+#hush-embed /* auto-cycling hint + tabs */
+  .autohint { font: 500 11px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: var(--text-lt); margin: 4px 0 12px; }
+#hush-embed .autohint::before { content: "▸ "; color: var(--amber); }
+#hush-embed .tabs { display: flex; gap: 8px; flex-wrap: wrap; margin: 20px 0 6px; }
+#hush-embed .tab { border: 2px solid var(--border-lt); background: var(--card); color: var(--green); font: 700 13px "DM Sans", sans-serif; padding: 8px 16px; border-radius: 999px; cursor: pointer; transition: background .15s ease, border-color .15s ease, color .15s ease; }
+#hush-embed .tab:hover { border-color: var(--sage); }
+#hush-embed .tab.on { background: var(--green); border-color: var(--green); color: var(--cream); }
+#hush-embed /* simulated color-page UI */
+  .resolve { background: #191920; border: 1px solid #2c2c34; border-radius: var(--r-md); overflow: hidden; box-shadow: 0 14px 34px rgba(20, 25, 20, .28); }
+#hush-embed .rbar { display: flex; align-items: center; gap: 6px; padding: 9px 12px; background: #22222a; border-bottom: 1px solid #2c2c34; }
+#hush-embed .rbar .dot { width: 10px; height: 10px; border-radius: 50%; }
+#hush-embed .rbar .dot.r { background: #e0655a; }
+#hush-embed .rbar .dot.y { background: #e5b03f; }
+#hush-embed .rbar .dot.g { background: #69b06a; }
+#hush-embed .rtitle { margin-left: 8px; font: 500 11px var(--mono); letter-spacing: .1em; color: #8a8a96; text-transform: uppercase; }
+#hush-embed .rmain { display: flex; }
+#hush-embed .rview { flex: 1; min-width: 0; background: #000; }
+#hush-embed .rview img { width: 100%; display: block; }
+#hush-embed .rfx { width: 230px; flex: none; background: #202027; border-left: 1px solid #2c2c34; padding: 16px; color: #c8c8d2; font: 500 12px var(--mono); }
+
+  @media (max-width: 780px) {#hush-embed .rfx { display: none; }
+ }#hush-embed .rfxhead { font-size: 10px; letter-spacing: .14em; color: #77778a; text-transform: uppercase; }
+#hush-embed .rfxplug { font: 700 15px "Space Grotesk", sans-serif; color: #fff; margin: 6px 0 16px; }
+#hush-embed .rfxgroup { font-size: 10px; letter-spacing: .1em; color: var(--amber); margin-bottom: 9px; text-transform: uppercase; }
+#hush-embed .rfxcheck { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }
+#hush-embed .rfxcheck .box { width: 13px; height: 13px; border-radius: 3px; background: var(--amber); border: 1.5px solid var(--amber); box-shadow: inset 0 0 0 2.5px #202027; flex: none; }
+#hush-embed .rslider { margin-bottom: 11px; }
+#hush-embed .rslider span { display: block; color: #9a9aa8; margin-bottom: 4px; }
+#hush-embed .rslider .rtrack { height: 4px; background: #33333e; border-radius: 2px; }
+#hush-embed .rslider .rtrack div { height: 4px; background: #7a8fa8; border-radius: 2px; }
+#hush-embed .rnodes { display: flex; align-items: center; padding: 14px 16px; background: #1d1d24; border-top: 1px solid #2c2c34; overflow-x: auto; }
+#hush-embed .rnode { min-width: 92px; flex: none; background: #2a2a33; border: 1.5px solid #4a4a58; border-radius: 6px; padding: 7px 9px; color: #9a9aa8; font: 700 9px var(--mono); letter-spacing: .06em; }
+#hush-embed .rnode b { display: block; color: #cfcfda; font-size: 10.5px; margin-top: 4px; font-weight: 700; }
+#hush-embed .rnode.on { border-color: var(--amber); box-shadow: 0 0 0 1px var(--amber); }
+#hush-embed .rnode.on b { color: var(--amber); }
+#hush-embed .rwire { width: 28px; height: 2px; background: #4a4a58; flex: none; }
 #hush-embed footer { padding: 54px 0 70px; }
 #hush-embed footer .credit { font-family: "Space Grotesk"; font-size: 19px; color: var(--green); }
-#hush-embed footer .credit .wm { color: var(--orange); }
+#hush-embed footer .credit a { color: var(--green); }
+#hush-embed footer .credit2 { font-size: 15.5px; color: var(--text-med); margin-top: 6px; }
+#hush-embed footer .wmlogo { display: block; width: 200px; max-width: 60vw; margin: 22px 0 4px; }
 #hush-embed footer p { font-size: 14px; color: var(--text-lt); margin-top: 8px; }
 
 
@@ -156,7 +202,7 @@
 
 <header class="wrap">
   <div class="topline">
-    <span>A Weird Machine Project</span>
+    <span>A <a href="https://weirdmachine.org">Weird Machine</a> project in collaboration with <a href="https://brooklineinteractive.org">Brookline Interactive Group</a></span>
     <span><a href="https://github.com/amateurmenace/OpenNR">source ↗</a></span>
   </div>
 
@@ -165,8 +211,9 @@
       <h1>Hush<span class="dot">.</span></h1>
       <div class="tag">OPEN NR · FOR DAVINCI RESOLVE</div>
       <p class="lead">Free, open-source noise reduction that works in the <b>free</b> version of
-      Resolve — and shows you every measurement it makes. New in v3: it sets
-      itself up.</p>
+      Resolve — and gives you insight and control into every move it makes.
+      Shoot in RAW or log without noise anxiety or being forced to pay.
+      New in v3: it sets itself up.</p>
       <svg class="squiggle" width="180" height="14" viewBox="0 0 180 14" fill="none">
         <path d="M2 8 Q 12 2, 22 8 T 42 8 T 62 8 T 82 8 T 102 8 T 122 8 T 142 8 T 162 8 T 178 8" stroke="#E5A835" stroke-width="3" stroke-linecap="round"/>
       </svg>
@@ -205,13 +252,17 @@
 <section>
   <div class="wrap">
     <div class="kicker">Why this exists</div>
-    <h2>Noise reduction is the paywall that hurts.</h2>
-    <p class="lede">Of everything DaVinci Resolve locks behind the Studio license, noise
-    reduction hits filmmakers hardest.</p>
-    <p>You can edit in the free version. You can grade in it. But shoot in low light — which
-    is to say, make an independent film — and you hit the wall: the NR palette is Studio-only.
-    And noise isn't cosmetic. <b>Color correction and VFX need a clean foundation</b> — every
-    contrast move amplifies grain, every key edges against it, every composite inherits it.</p>
+    <h2>The moment you go pro, the safety net disappears.</h2>
+    <p class="lede">Every phone and consumer camera quietly denoises your footage before
+    you ever see it. Step up to RAW or log — the formats that make real grading possible —
+    and that baked-in cleanup is gone.</p>
+    <p>Suddenly you're looking at the sensor's honest, noisy signal, and dealing with it is
+    your job now. This is the wall many people hit going from consumer to pro: there hasn't
+    been a <b>free, effective, efficient</b> tool for getting to a clean starting place for
+    your grade. Resolve's own NR palette is Studio-only; the third-party plugins are paid.
+    And noise isn't cosmetic — <b>color correction and VFX need a clean foundation</b>:
+    every contrast move amplifies grain, every key edges against it, every composite
+    inherits it.</p>
     <p>Here's the thing: <b>you don't need AI for this.</b> Good noise reduction is robust
     statistics, careful signal processing, and honest engineering — plus the will to not
     charge for it. Hush gets you Studio-class results, free, with something even the paid
@@ -295,7 +346,8 @@
 <section class="alt">
   <div class="wrap">
     <div class="kicker">How it works</div>
-    <h2>Five steps. Click each one.</h2>
+    <h2>Five steps. Click each to learn more.</h2>
+    <div class="autohint" id="hush-pipeHint">auto-cycling — click any step to explore</div>
     <div class="pipe" id="hush-pipe">
       <div class="step on" data-d="Three estimators measure the noise of every frame: median frame-to-frame difference (immune to the correlated, blotchy noise compression creates), plus fine and coarse Laplacian statistics — with a separate estimate for every brightness band, because shadows are noisier than highlights. Robust medians keep edges, texture and motion out of the measurement, and exactly-flat pixels (letterbox bars, crushed blacks) are excluded so they can't drag the estimate toward zero. Lock the profile and every frame filters against the same numbers."><span class="n">1</span><b>Measure</b><small>3 estimators × 16 brightness bands</small></div>
       <div class="step" data-d="Each pixel is compared patch-wise against up to two frames either side — and in v3, at nine candidate alignments, so slow pans and handheld drift keep their averaging (Motion Tracking). Below the expected pure-noise difference, frames average freely; past the motion threshold the gate closes to exactly zero — mismatched pixels can't bleed in, so motion can't ghost, by construction. A firefly zapper clips hot pixels to the temporal median first, and a live Motion Map scope shows green where frames are stacking, red where protection kicked in."><span class="n">2</span><b>Temporal</b><small>motion-tracked, hard-knee gate, zero ghosting</small></div>
@@ -332,12 +384,54 @@
     <h2>See what it sees.</h2>
     <p>Resolve's built-in NR is a black box: sliders in, pixels out. Hush renders its
     measurements into the viewer — because a tool this consequential to your image
-    shouldn't require faith. In v3.1 every step has its own <b>Scope</b> checkbox,
-    and the panels combine over any view.</p>
-    <div class="g2">
-      <figure class="shot"><img src="https://amateurmenace.github.io/OpenNR/assets/hud.jpg" alt="v3.1 scopes: Measurements, Noise EQ, Motion Map"><figcaption><b>The v3.1 scopes, together.</b> <b>Measurements</b> (top left): input noise in blue, post-temporal residual in amber, frames averaged, SNR gain, the noise-vs-brightness curve and the histogram. <b>Noise EQ</b> (top right): one lane per band — bar = your cut, amber line = measured noise at that size. <b>Motion Map</b> (bottom right): green where frames are stacking, red where motion protection kicked in.</figcaption></figure>
-      <figure class="shot"><img src="https://amateurmenace.github.io/OpenNR/assets/snr.jpg" alt="SNR heat map"><figcaption><b>SNR Map.</b> Signal-to-noise per pixel: magenta where noise dominates (where NR matters most), green where the image wins. The whole pipeline is inspectable — Input, After Temporal, Noise Removed (auto-gained, soft-kneed), Temporal Activity, and a keyable Noisiness matte.</figcaption></figure>
+    shouldn't require faith. Every step has its own <b>Scope</b> checkbox, the panels
+    combine over any view, and they're drawn by the same kernels that filter — the
+    display can't disagree with what's happening. Here is each one on the color page:</p>
+
+    <div class="tabs" id="hush-scopeTabs">
+      <button class="tab on"
+        data-img="https://amateurmenace.github.io/OpenNR/assets/scope-measure.jpg"
+        data-chk="Scope: Measurements" data-step="Step 1 · Measure"
+        data-cap="The Measurements panel — input noise (blue) vs what's left after temporal stacking (amber), frames averaged, SNR gain, the noise-vs-brightness curve, and the histogram with its median. Tick it in Step 1; LOCKED appears when the profile is frozen.">Measurements</button>
+      <button class="tab"
+        data-img="https://amateurmenace.github.io/OpenNR/assets/scope-motion.jpg"
+        data-chk="Scope: Motion Map" data-step="Step 2 · Temporal"
+        data-cap="The Motion Map — green where frames are being stacked, red where motion protection kicked in. This frame is from a drifting camera: motion tracking keeps the flats stacking while every moving edge stays protected. If something ghosts, it should be reading red here.">Motion Map</button>
+      <button class="tab"
+        data-img="https://amateurmenace.github.io/OpenNR/assets/scope-eq.jpg"
+        data-chk="Scope: Noise EQ" data-step="Step 3 · Spatial · Noise EQ"
+        data-cap="The Noise EQ scope — one lane per band (Fine ~1 px, Clumps 3–8 px, Stains 16 px+, Color). The bar is how much you're cutting; the amber line is how much noise was actually measured at that size. It pops up by itself the first time you touch an EQ slider.">Noise EQ</button>
+      <button class="tab"
+        data-img="https://amateurmenace.github.io/OpenNR/assets/scope-snr.jpg"
+        data-chk="View: SNR Map" data-step="Step 5 · Inspect"
+        data-cap="The SNR Map view — signal-to-noise per pixel: magenta where noise dominates (where NR matters most), green where the image wins. The whole pipeline is inspectable: Input, After Temporal, Noise Removed, Temporal Activity, and a keyable Noisiness matte.">SNR Map</button>
     </div>
+    <div class="autohint" id="hush-scopeHint">auto-cycling — click a tab to explore</div>
+
+    <div class="resolve reg">
+      <div class="rbar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+        <span class="rtitle">viewer — simulated color page</span></div>
+      <div class="rmain">
+        <div class="rview"><img id="hush-scopeImg" src="https://amateurmenace.github.io/OpenNR/assets/scope-measure.jpg" alt="Hush scope in the viewer"></div>
+        <aside class="rfx">
+          <div class="rfxhead">OpenFX · Effects</div>
+          <div class="rfxplug">Hush Open NR</div>
+          <div class="rfxgroup" id="hush-scopeStep">Step 1 · Measure</div>
+          <label class="rfxcheck"><span class="box"></span><span id="hush-scopeChk">Scope: Measurements</span></label>
+          <div class="rslider"><span>Strength</span><div class="rtrack"><div style="width:34%"></div></div></div>
+          <div class="rslider"><span>Luma Strength</span><div class="rtrack"><div style="width:60%"></div></div></div>
+          <div class="rslider"><span>Chroma Strength</span><div class="rtrack"><div style="width:100%"></div></div></div>
+          <div class="rslider"><span>Detail Rescue</span><div class="rtrack"><div style="width:40%"></div></div></div>
+        </aside>
+      </div>
+      <div class="rnodes">
+        <div class="rnode on">01<b>HUSH OPEN NR</b></div><span class="rwire"></span>
+        <div class="rnode">02<b>BALANCE</b></div><span class="rwire"></span>
+        <div class="rnode">03<b>SECONDARIES</b></div><span class="rwire"></span>
+        <div class="rnode">04<b>LOOK</b></div>
+      </div>
+    </div>
+    <p class="cap" id="hush-scopeCap" style="margin-top:12px">The Measurements panel — input noise (blue) vs what's left after temporal stacking (amber), frames averaged, SNR gain, the noise-vs-brightness curve, and the histogram with its median. Tick it in Step 1; LOCKED appears when the profile is frozen.</p>
   </div>
 </section>
 
@@ -420,15 +514,41 @@ gain(band) = 1 + w · (σ_band/σ_ref − 1)      w = n/(n + 2000)   (confidence
       <li>Click <b>Auto Setup</b>, then tick a <b>Scope</b> checkbox (Step 1 Measurements, Step 2 Motion Map, Step 3 Noise EQ) to watch it work — and for tricky footage, drag the yellow sampling rectangle right in the viewer. Untick scopes before rendering.</li>
     </ol>
     <p class="cap">Works in the free version of Resolve (third-party OpenFX has been supported there since v15). The Windows build renders via OpenCL (NVIDIA, AMD and Intel GPUs); Linux builds from source.</p>
+
+    <h3 style="margin-top:44px">Colorist tips</h3>
+    <div class="tips">
+      <div class="tipcard"><span class="tn">Tip 01 · Do this first</span>
+        <b>Denoise at node one, grade with it on.</b>
+        <p>Put Hush at the very start of your node tree and leave it enabled while you
+        grade — every contrast and saturation move amplifies whatever noise it sits on,
+        so grade on the clean signal. Want smooth playback? Toggle the node off
+        (Cmd/Ctrl-D) while you work, or right-click the node and turn on its
+        <b>node cache</b> so it renders once and plays free.</p></div>
+      <div class="tipcard"><span class="tn">Tip 02 · Free friends</span>
+        <b>Pair it with Resolve's own free tools.</b>
+        <p>Hush composes beautifully with what's already in the free version. Classic
+        move: a <b>Lum&nbsp;vs&nbsp;Sat curve</b> on a later node, pulling saturation out of the
+        darkest stops — chroma noise lives in the shadows, and what filtering can't
+        remove, desaturation hides. (Hush's own Shadow Desaturate does this in-plugin;
+        the curve gives you a finer hand.)</p></div>
+      <div class="tipcard"><span class="tn">Tip 03 · Texture back</span>
+        <b>Re-texture inside, sharpen after.</b>
+        <p>After the smoothing, Step 4 puts authentic energy back: <b>Luma Texture</b>
+        re-injects the original brightness grain, and <b>Film Grain</b> (with Size and
+        Color) lays down clean, midtone-weighted synthetic stock. Even so, a subtle
+        <b>sharpening node right after</b> Hush is sometimes the last five percent.</p></div>
+    </div>
   </div>
 </section>
 
 <footer>
   <div class="wrap reg">
     <div class="bars" style="margin-bottom:28px"><span style="background:#3D5A47"></span><span style="background:#5B8C65"></span><span style="background:#A3C0B0"></span><span style="background:#E5A835"></span><span style="background:#E89D6B"></span><span style="background:#C5D6CC"></span><span style="background:#2D3A2E"></span></div>
-    <div class="credit">A <span class="wm">Weird Machine</span> project.</div>
-    <p>Produced by Stephen Walter with Claude Code. And math.<br>
-    MIT licensed — free for any use, forever. Source, issues and releases on
+    <div class="credit">Produced by <a href="https://weirdmachine.org">Stephen Walter</a> and Claude Code in 2026.</div>
+    <p class="credit2">An open-source tool of the <a href="https://communityai.studio">Community AI Project</a>,
+    made in partnership with <a href="https://brooklineinteractive.org">Brookline Interactive Group</a>.</p>
+    <a href="https://weirdmachine.org"><img class="wmlogo" src="https://amateurmenace.github.io/OpenNR/assets/wm-logo.png" alt="Weird Machine"></a>
+    <p>MIT licensed — free for any use, forever. Source, issues and releases on
     <a href="https://github.com/amateurmenace/OpenNR">GitHub</a>.</p>
   </div>
 </footer>
@@ -579,17 +699,69 @@ gain(band) = 1 + w · (σ_band/σ_ref − 1)      w = n/(n + 2000)   (confidence
   window.addEventListener('pointerup', function () { dragging = false; });
 })();
 
-/* ============ pipeline cards ============ */
+/* ============ pipeline cards: auto-cycle until first click ============ */
 (function () {
   const steps = document.querySelectorAll('#hush-pipe .step');
   const text = document.getElementById('hush-pipeText');
-  steps.forEach(function (s) {
+  const hint = document.getElementById('hush-pipeHint');
+  const pipe = document.getElementById('hush-pipe');
+  let idx = 0, timer = null;
+  function sel(i) {
+    idx = i;
+    steps.forEach(function (o, k) { o.classList.toggle('on', k === i); });
+    text.textContent = steps[i].dataset.d;
+  }
+  steps.forEach(function (s, k) {
     s.addEventListener('click', function () {
-      steps.forEach(function (o) { o.classList.remove('on'); });
-      s.classList.add('on');
-      text.textContent = s.dataset.d;
+      if (timer) { clearInterval(timer); timer = null; hint.textContent = 'click any step to learn more'; }
+      sel(k);
     });
   });
+  // start cycling only once the section is on screen; stop on interaction
+  const io = new IntersectionObserver(function (es) {
+    es.forEach(function (e) {
+      if (e.isIntersecting && !timer) {
+        timer = setInterval(function () { sel((idx + 1) % steps.length); }, 3200);
+        io.disconnect();
+      }
+    });
+  }, { threshold: 0.35 });
+  io.observe(pipe);
+})();
+
+/* ============ scope showcase: tabs + auto-cycle until first click ============ */
+(function () {
+  const tabs = document.querySelectorAll('#hush-scopeTabs .tab');
+  const img = document.getElementById('hush-scopeImg');
+  const cap = document.getElementById('hush-scopeCap');
+  const chk = document.getElementById('hush-scopeChk');
+  const stp = document.getElementById('hush-scopeStep');
+  const hint = document.getElementById('hush-scopeHint');
+  let idx = 0, timer = null;
+  function show(i) {
+    idx = i;
+    tabs.forEach(function (t, k) { t.classList.toggle('on', k === i); });
+    const t = tabs[i];
+    img.src = t.dataset.img;
+    cap.textContent = t.dataset.cap;
+    chk.textContent = t.dataset.chk;
+    stp.textContent = t.dataset.step;
+  }
+  tabs.forEach(function (t, k) {
+    t.addEventListener('click', function () {
+      if (timer) { clearInterval(timer); timer = null; hint.textContent = 'click a tab to explore'; }
+      show(k);
+    });
+  });
+  const io = new IntersectionObserver(function (es) {
+    es.forEach(function (e) {
+      if (e.isIntersecting && !timer) {
+        timer = setInterval(function () { show((idx + 1) % tabs.length); }, 4200);
+        io.disconnect();
+      }
+    });
+  }, { threshold: 0.3 });
+  io.observe(img);
 })();
 
 /* ============ chart animation on scroll ============ */

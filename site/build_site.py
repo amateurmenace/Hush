@@ -7,13 +7,16 @@
 import base64, os, sys
 here = os.path.dirname(os.path.abspath(__file__))
 imgs = {"B64_AFTER": "after.jpg", "B64_BEFORE": "before.jpg",
-        "B64_HUD": "hud.jpg", "B64_SNR": "snr.jpg"}
+        "B64_SCM": "scope-measure.jpg", "B64_SCMO": "scope-motion.jpg",
+        "B64_SCEQ": "scope-eq.jpg", "B64_SCSNR": "scope-snr.jpg",
+        "B64_WM": "wm-logo.png"}
 html = open(os.path.join(here, "index.template.html")).read()
 for tok, name in imgs.items():
     p = os.path.join(here, "assets", name)
     if not os.path.exists(p):
         sys.exit(f"missing {p} — see comments for how to regenerate")
-    html = html.replace(f"%%{tok}%%", "data:image/jpeg;base64," + base64.b64encode(open(p, "rb").read()).decode())
+    mime = "image/png" if name.endswith(".png") else "image/jpeg"
+    html = html.replace(f"%%{tok}%%", f"data:{mime};base64," + base64.b64encode(open(p, "rb").read()).decode())
 open(os.path.join(here, "index.html"), "w").write(html)
 docs = os.path.join(here, "..", "docs")
 os.makedirs(os.path.join(docs, "assets"), exist_ok=True)

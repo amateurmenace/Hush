@@ -12,6 +12,9 @@ test/hush_cli
 test/test_speak
 test/test_speak_metal
 test/test_speak_opencl
+test/test_speak_macbeth
+test/test_speak_split
+test/proto_halation
 test/render_speak
 test/*.ppm
 test/*.png

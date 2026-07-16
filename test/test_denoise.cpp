@@ -1599,6 +1599,102 @@ int main()
     }
 
     // =====================================================================
+    // v3.5 X1 — MC-SURE self-tune: the grid argmin must track true MSE
+    // =====================================================================
+    {
+        // a 320x180 crop of the scene (the plugin tunes on a centre crop of
+        // the real stack; the math is size-agnostic). The window offset
+        // catches both circles, the gradient and part of the texture/bars.
+        const int CW = 320, CH = 180;
+        auto renderCrop = [&](std::vector<float>& img) {
+            img.resize(static_cast<size_t>(CW) * CH * 4);
+            for (int y = 0; y < CH; ++y)
+                for (int x = 0; x < CW; ++x) {
+                    float r, g, b;
+                    scenePixel(x + 160.0f, y + 90.0f, r, g, b);
+                    float* px = &img[(static_cast<size_t>(y) * CW + x) * 4];
+                    px[0] = r; px[1] = g; px[2] = b; px[3] = 1.0f;
+                }
+        };
+        std::vector<std::vector<float>> fr(7);
+        for (int k = 0; k < 7; ++k) {
+            renderCrop(fr[k]);
+            addNoise(fr[k], 0.05f, 8100u + static_cast<uint32_t>(k));
+        }
+        std::vector<float> clean;
+        renderCrop(clean);
+        const float* fp[7] = { fr[0].data(), fr[1].data(), fr[2].data(),
+                               fr[3].data(), fr[4].data(), fr[5].data(),
+                               fr[6].data() };
+
+        // base = the mapped table settings for what the crop measures —
+        // exactly what Auto Setup would apply un-tuned
+        std::vector<nrcore::Stats> per(1);
+        {
+            nrcore::Params ap;
+            nrcore::estimateInput(fp[3], fp[2], CW, CH, ap, per[0]);
+        }
+        const nranalyze::ClipAggregate agg = nranalyze::aggregateClipStats(per);
+        const nranalyze::AutoSettings as = nranalyze::mapAnalysisToSettings(agg);
+        const nrcore::Params base = nranalyze::paramsFromAutoSettings(as);
+
+        nranalyze::SureTune tn = nranalyze::sureTuneGrid(fp, CW, CH, base);
+        check(tn.ran == 1, "SURE tuner ran");
+
+        // the true objective on the SAME grid: luma MSE vs the known clean
+        auto lumaMse = [&](const std::vector<float>& img) {
+            double mse = 0.0;
+            size_t cnt = 0;
+            for (int y = 8; y < CH - 8; ++y)
+                for (int x = 8; x < CW - 8; ++x) {
+                    const size_t i = (static_cast<size_t>(y) * CW + x) * 4;
+                    float ya, cba, cra, yc, cbc, crc;
+                    nrcore::rgb2ycc(img[i], img[i + 1], img[i + 2], ya, cba, cra);
+                    nrcore::rgb2ycc(clean[i], clean[i + 1], clean[i + 2], yc, cbc, crc);
+                    const double d = static_cast<double>(ya) - yc;
+                    mse += d * d;
+                    ++cnt;
+                }
+            return mse / static_cast<double>(cnt);
+        };
+        double mseG[3][3];
+        std::vector<float> gout(static_cast<size_t>(CW) * CH * 4), gscratch;
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j) {
+                nrcore::Params g = base;
+                g.temporalLuma = tn.gridT[i];
+                g.spatialLuma  = tn.gridS[j];
+                nrcore::denoiseFrame(fp, CW, CH, g, gout.data(), gscratch);
+                mseG[i][j] = lumaMse(gout);
+            }
+        int bi = 0, bj = 0;
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                if (mseG[i][j] < mseG[bi][bj]) { bi = i; bj = j; }
+
+        printf("v3.5 SURE tune: argmin SURE (%d,%d) vs argmin MSE (%d,%d), sigma %.4f eps %.5f\n",
+               tn.ti, tn.si, bi, bj, tn.sigma, tn.eps);
+        check(std::abs(tn.ti - bi) <= 1 && std::abs(tn.si - bj) <= 1,
+              "SURE argmin within 1 grid step of true-MSE argmin");
+
+        // the tuned pick must never lose vs the table pick (true luma PSNR)
+        const double psnrTable = 10.0 * std::log10(1.0 / std::max(mseG[1][1], 1e-12));
+        const double psnrTuned = 10.0 * std::log10(1.0 / std::max(mseG[tn.ti][tn.si], 1e-12));
+        printf("v3.5 SURE tune: table %5.2f dB -> tuned %5.2f dB (TL %.0f->%.0f, SL %.0f->%.0f)\n",
+               psnrTable, psnrTuned, base.temporalLuma * 100.0f, tn.temporalLuma * 100.0f,
+               base.spatialLuma * 100.0f, tn.spatialLuma * 100.0f);
+        check(psnrTuned >= psnrTable - 0.1, "tuned settings never lose vs the table (0.1 dB guard)");
+
+        // bit-exact determinism (fixed-seed Rademacher, no RNG state)
+        nranalyze::SureTune tn2 = nranalyze::sureTuneGrid(fp, CW, CH, base);
+        bool det = (tn2.ti == tn.ti) && (tn2.si == tn.si);
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                det = det && (tn2.sure[i][j] == tn.sure[i][j]);
+        check(det, "SURE tuner is deterministic across runs");
+    }
+
+    // =====================================================================
     // v3.5 P1 — exposure match: a step or flicker must not gate the stack out
     // =====================================================================
     {

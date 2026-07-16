@@ -596,6 +596,76 @@ private:
         return true;
     }
 
+    // v3.5 X1 — MC-SURE self-tune at Auto Setup: fetch the real 7-frame
+    // stack at the playhead, centre-crop it (<=512x288 — the grid costs 18
+    // CPU denoises, so the crop pays that bill, not the user) and sweep
+    // (temporal luma, spatial luma) around the table values. Any fetch
+    // failure returns not-ran: Auto Setup must never fail because of the
+    // tuner. Deterministic: fixed-seed Rademacher, same playhead = same
+    // frames = same answer.
+    nranalyze::SureTune tuneAutoSetupAt(double p_Time, const nranalyze::AutoSettings& p_As)
+    {
+        nranalyze::SureTune r;
+        try
+        {
+            if (!m_SrcClip || !m_SrcClip->isConnected())
+                return r;
+            const OfxRangeD range = m_SrcClip->getFrameRange();
+            // seven times, clamped at the clip edges; duplicate times ALIAS
+            // the same crop pointer so the pipeline's pointer-equality edge
+            // logic sees a real clip edge, exactly like a render would
+            double times[7];
+            for (int k = 0; k < 7; ++k)
+            {
+                double tk = p_Time + (k - 3);
+                if (tk < range.min) tk = range.min;
+                if (tk > range.max) tk = range.max;
+                times[k] = tk;
+            }
+            std::vector<float> crops[7];
+            const float* fp[7] = { 0, 0, 0, 0, 0, 0, 0 };
+            int cw = 0, ch = 0;
+            for (int k = 0; k < 7; ++k)
+            {
+                int prior = -1;
+                for (int j = 0; j < k; ++j)
+                    if (times[j] == times[k]) { prior = j; break; }
+                if (prior >= 0)
+                {
+                    fp[k] = fp[prior];
+                    continue;
+                }
+                std::unique_ptr<OFX::Image> img(m_SrcClip->fetchImage(times[k]));
+                if (!img || img->getPixelDepth() != OFX::eBitDepthFloat ||
+                    img->getPixelComponents() != OFX::ePixelComponentRGBA)
+                    return r;
+                int W = 0, H = 0;
+                std::vector<float> buf;
+                packImage(img.get(), W, H, buf);
+                if (W < 64 || H < 64)
+                    return r;
+                const int tw = std::min(W, 512) & ~1;
+                const int th = std::min(H, 288) & ~1;
+                if (cw == 0) { cw = tw; ch = th; }
+                else if (tw != cw || th != ch)
+                    return r;
+                const int x0 = (W - tw) / 2, y0 = (H - th) / 2;
+                crops[k].resize(static_cast<size_t>(tw) * th * 4);
+                for (int y = 0; y < th; ++y)
+                    std::memcpy(&crops[k][static_cast<size_t>(y) * tw * 4],
+                                &buf[(static_cast<size_t>(y0 + y) * W + x0) * 4],
+                                static_cast<size_t>(tw) * 4 * sizeof(float));
+                fp[k] = crops[k].data();
+            }
+            r = nranalyze::sureTuneGrid(fp, cw, ch, nranalyze::paramsFromAutoSettings(p_As));
+        }
+        catch (...)
+        {
+            r.ran = 0;   // any host hiccup: the table values stand
+        }
+        return r;
+    }
+
     void runAutoSetup(double p_Time)
     {
         int srcNow0 = 0;
@@ -626,7 +696,18 @@ private:
             agg = sw.agg;                          // not of the user's patch
             agg.motion = clipMotion;
         }
-        const nranalyze::AutoSettings as = nranalyze::mapAnalysisToSettings(agg);
+        nranalyze::AutoSettings as = nranalyze::mapAnalysisToSettings(agg);
+
+        // v3.5 X1: MC-SURE self-tune on a centre crop of the real stack at
+        // the playhead — the two swept sliders are overwritten only when the
+        // sweep actually ran (~3-5 s, all CPU, deterministic; the table is
+        // always the fallback)
+        const nranalyze::SureTune tuned = tuneAutoSetupAt(p_Time, as);
+        if (tuned.ran)
+        {
+            as.temporalLuma = tuned.temporalLuma * 100.0f;
+            as.spatialLuma  = tuned.spatialLuma * 100.0f;
+        }
 
         // belt and braces: the whole apply is one edit block (single Cmd+Z),
         // AND the prior values are snapshotted for the Revert button
@@ -659,7 +740,10 @@ private:
         m_LockProfile->setValue(as.lockProfile != 0);
         int srcNow = 0;
         m_ProfileSource->getValue(srcNow);
-        m_AutoReport->setValue(nranalyze::formatAutoReport(agg, as, srcNow == 1 ? 1 : 0, flat));
+        std::string report = nranalyze::formatAutoReport(agg, as, srcNow == 1 ? 1 : 0, flat);
+        if (tuned.ran)
+            report += " \xc2\xb7 tuned";   // the SURE sweep confirmed or moved the sliders
+        m_AutoReport->setValue(report);
         endEditBlock();
         m_InAutoApply = false;
 

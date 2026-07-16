@@ -679,6 +679,172 @@ inline std::string formatAutoReport(const ClipAggregate& a, const AutoSettings& 
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// v3.5 X1 — Monte-Carlo SURE self-tuning for Auto Setup.
+//
+// Stein's unbiased risk estimate scores a denoiser's true MSE against the
+// UNKNOWN clean image using only the noisy input and the denoiser itself:
+//
+//   SURE = ||f(y) - y||^2 / N  -  sigma^2  +  (2 sigma^2 / N) * div f(y)
+//
+// with the divergence estimated Monte-Carlo (Ramani et al.):
+//
+//   div f(y) ~= sum_i b_i * (f(y + eps*b)_i - f(y)_i) / eps
+//
+// b = +/-1 Rademacher from nrcore::hashNoise at a FIXED seed, so the whole
+// tuner is deterministic across runs and machines. Luma only: y is the
+// centre frame's luma, the perturbation shifts R,G,B together (luma moves,
+// chroma untouched), and f() is the FULL pipeline at the candidate settings
+// (neighbour frames ride along as side information — their noise is
+// independent of the centre's, which is all Stein's identity needs).
+//
+// sureTuneGrid sweeps a 3x3 grid of (temporalLuma, spatialLuma) around the
+// base settings (+/-25%, the slider range's natural neighbourhood) and
+// returns the SURE argmin. 18 denoiseFrame runs on the caller's crop —
+// size the crop, not the grid.
+// ---------------------------------------------------------------------------
+// Build the CPU Params that Auto Setup's sliders would produce — the tuner
+// must score EXACTLY the pipeline the user gets after Apply (UI percents
+// become fractions; everything not in AutoSettings keeps plugin defaults).
+inline nrcore::Params paramsFromAutoSettings(const AutoSettings& s)
+{
+    nrcore::Params p;
+    p.enableTemporal = s.enableTemporal;
+    p.temporalFrames = s.temporalFrames;
+    p.temporalLuma   = s.temporalLuma / 100.0f;
+    p.temporalChroma = s.temporalChroma / 100.0f;
+    p.motionThresh   = s.motionThresh / 100.0f;
+    p.motionTracking = s.motionTracking;
+    p.fireflyRemoval = s.fireflyRemoval;
+    p.ghostGuard     = s.ghostGuard;
+    p.enableSpatial  = s.enableSpatial;
+    p.spatialMode    = s.spatialMode;
+    p.spatialRadius  = s.spatialRadius;
+    p.spatialLuma    = s.spatialLuma / 100.0f;
+    p.spatialChroma  = s.spatialChroma / 100.0f;
+    p.preserveDetail = s.preserveDetail / 100.0f;
+    p.detailRescue   = s.detailRescue / 100.0f;
+    p.deepClean      = s.deepClean;
+    p.chromaBlotch   = s.chromaBlotch / 100.0f;
+    p.eqFine         = s.eqFine / 100.0f;
+    p.eqMedium       = s.eqMedium / 100.0f;
+    p.eqCoarse       = s.eqCoarse / 100.0f;
+    p.profileAdjust  = s.profileAdjust;
+    return p;
+}
+
+struct SureTune {
+    int    ran = 0;              // 1 when the grid ran (fetch etc. succeeded)
+    int    ti = 1, si = 1;       // winning grid indices (1,1 = table values)
+    float  temporalLuma = 0.0f;  // winning values, PARAM fractions (UI/100)
+    float  spatialLuma  = 0.0f;
+    float  gridT[3] = {0, 0, 0}; // the swept fractions (tests re-run these)
+    float  gridS[3] = {0, 0, 0};
+    double sure[3][3];           // the surface (tests assert determinism)
+    float  sigma = 0.0f, eps = 0.0f;
+};
+
+inline float sureLuma(const float* px)
+{
+    float y, cb, cr;
+    nrcore::rgb2ycc(px[0], px[1], px[2], y, cb, cr);
+    return y;
+}
+
+inline SureTune sureTuneGrid(const float* const frames[7], int W, int H,
+                             const nrcore::Params& base)
+{
+    SureTune r;
+    if (W < 32 || H < 32)
+        return r;
+    const size_t n  = static_cast<size_t>(W) * H * 4;
+    const size_t nl = static_cast<size_t>(W) * H;
+
+    // sigma once, from the input (settings don't change the input measure);
+    // the temporal-pair estimate is immune to spatial correlation and is
+    // what "the noise" means for SURE's iid model — fall back to spatial
+    // when the stack has no distinct neighbour
+    const float* partner = 0;
+    if (frames[2] != frames[3])      partner = frames[2];
+    else if (frames[4] != frames[3]) partner = frames[4];
+    nrcore::Params p0 = base;
+    nrcore::Stats s0;
+    nrcore::estimateInput(frames[3], partner, W, H, p0, s0);
+    const float sigma = s0.hadTemporal ? s0.ty : s0.sy;
+    // eps = sigma/20: small enough that f stays in its linear regime,
+    // large enough that float cancellation in f(y+eps*b)-f(y) stays well
+    // above the mantissa floor (validated on the synthetic suite)
+    const float eps = std::max(sigma * 0.05f, 1e-4f);
+    r.sigma = sigma;
+    r.eps = eps;
+
+    // fixed-seed Rademacher field + the perturbed centre frame. Neighbour
+    // slots that ALIAS the centre (clip edges) must alias the perturbed
+    // centre too, or the pointer-equality partner logic inside denoiseFrame
+    // flips between the two runs and the divergence measures the estimator
+    // flapping instead of the filter.
+    std::vector<float> pert(n);
+    std::vector<signed char> rad(nl);
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const size_t i = static_cast<size_t>(y) * W + x;
+            const signed char b =
+                (nrcore::hashNoise(static_cast<uint32_t>(x),
+                                   static_cast<uint32_t>(y), 977u, 7u) >= 0.0f) ? 1 : -1;
+            rad[i] = b;
+            const float d = eps * static_cast<float>(b);
+            pert[i * 4 + 0] = frames[3][i * 4 + 0] + d;
+            pert[i * 4 + 1] = frames[3][i * 4 + 1] + d;
+            pert[i * 4 + 2] = frames[3][i * 4 + 2] + d;
+            pert[i * 4 + 3] = frames[3][i * 4 + 3];
+        }
+    const float* pf[7];
+    for (int k = 0; k < 7; ++k)
+        pf[k] = (frames[k] == frames[3]) ? pert.data() : frames[k];
+
+    static const float kStep[3] = { 0.75f, 1.0f, 1.25f };
+    for (int i = 0; i < 3; ++i) {
+        r.gridT[i] = clampfLocal(base.temporalLuma * kStep[i], 0.0f, 1.25f);
+        r.gridS[i] = clampfLocal(base.spatialLuma * kStep[i], 0.0f, 1.25f);
+    }
+
+    std::vector<float> outA(n), outB(n), scratch;
+    double bestSure = 0.0;
+    for (int ti = 0; ti < 3; ++ti)
+        for (int si = 0; si < 3; ++si) {
+            nrcore::Params p = base;
+            p.temporalLuma = r.gridT[ti];
+            p.spatialLuma  = r.gridS[si];
+            nrcore::denoiseFrame(frames, W, H, p, outA.data(), scratch);
+            nrcore::denoiseFrame(pf, W, H, p, outB.data(), scratch);
+
+            double rss = 0.0, div = 0.0;
+            for (size_t i = 0; i < nl; ++i) {
+                const float ly  = sureLuma(frames[3] + i * 4);
+                const float fy  = sureLuma(outA.data() + i * 4);
+                const float fyp = sureLuma(outB.data() + i * 4);
+                const double d = static_cast<double>(fy) - ly;
+                rss += d * d;
+                div += static_cast<double>(rad[i]) * (static_cast<double>(fyp) - fy);
+            }
+            div /= eps;
+            const double sure = rss / static_cast<double>(nl)
+                              - static_cast<double>(sigma) * sigma
+                              + (2.0 * sigma * sigma / static_cast<double>(nl)) * div;
+            r.sure[ti][si] = sure;
+            if ((ti == 0 && si == 0) || sure < bestSure) {
+                bestSure = sure;
+                r.ti = ti;
+                r.si = si;
+            }
+        }
+
+    r.temporalLuma = r.gridT[r.ti];
+    r.spatialLuma  = r.gridS[r.si];
+    r.ran = 1;
+    return r;
+}
+
 } // namespace nranalyze
 
 #endif // OPENNR_NR_ANALYZE_H

@@ -217,6 +217,27 @@ inline bool hdScopePixel(int x, int y, int W, int H, const SpeakParams* pr,
     return true;
 }
 
+inline void deliverInput(const SpeakParams* pr, float r, float g, float b,
+                         float* oR, float* oG, float* oB)
+{
+    if (pr->outputMode == 1) {
+        int cs = pr->inputColorSpace;
+        float lr = decodeToLinear(cs, r);
+        float lg = decodeToLinear(cs, g);
+        float lb = decodeToLinear(cs, b);
+        float rr, rg, rb;
+        gamutToRec709Lin(cs, lr, lg, lb, &rr, &rg, &rb);
+        rr = rr < 0.0f ? 0.0f : rr;
+        rg = rg < 0.0f ? 0.0f : rg;
+        rb = rb < 0.0f ? 0.0f : rb;
+        *oR = encodeFromLinear(1, rr);
+        *oG = encodeFromLinear(1, rg);
+        *oB = encodeFromLinear(1, rb);
+    } else {
+        *oR = r; *oG = g; *oB = b;
+    }
+}
+
 inline void processPixel(float r, float g, float b, int x, int y, int W, int H,
                          const SpeakParams* pr, float* outR, float* outG, float* outB)
 {
@@ -251,8 +272,8 @@ inline void processPixel(float r, float g, float b, int x, int y, int W, int H,
             *outB = encodeFromLinear(cs, mb);
         }
     }
-    if (pr->viewMode == 2) { *outR = r; *outG = g; *outB = b; }
-    else if (pr->viewMode == 1 && x < W / 2) { *outR = r; *outG = g; *outB = b; }
+    if (pr->viewMode == 2 || (pr->viewMode == 1 && x < W / 2))
+        deliverInput(pr, r, g, b, outR, outG, outB);
 
     float sr, sg, sb;
     if (hdScopePixel(x, y, W, H, pr, &sr, &sg, &sb)) { *outR = sr; *outG = sg; *outB = sb; }

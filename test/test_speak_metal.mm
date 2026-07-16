@@ -129,6 +129,9 @@ int main()
     // 5c — Bake with look off (pure CST).
     { SpeakParams p = baseParams(); p.outputMode = SPEAK_OUT_BAKE_REC709; p.strength = 0.0f;
       run(device, queue, W, H, p, "bake Rec.709 CST-only", 2); }
+    // 5d — Bake + Split view (both halves must land in Rec.709).
+    { SpeakParams p = baseParams(); p.outputMode = SPEAK_OUT_BAKE_REC709; p.viewMode = SPEAK_VIEW_SPLIT; p.profile = stockProfile();
+      run(device, queue, W, H, p, "bake + split view", 2); }
     // 6 — H&D scope on (hud-tolerant).
     { SpeakParams p = baseParams(); p.scopeHD = 1; p.strength = 0.6f; p.profile = stockProfile();
       run(device, queue, W, H, p, "scope H&D on s0.6", 1); }

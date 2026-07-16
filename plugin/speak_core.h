@@ -300,6 +300,31 @@ static inline bool hdScopePixel(int x, int y, int W, int H, const SpeakParams& p
     return true;
 }
 
+// The INPUT pixel delivered through the same output CST as the result (no look
+// applied). Split/Input views use this so both halves of a comparison are in
+// the SAME space: in Bake mode both are Rec.709 (a valid look A/B), in Working
+// mode both are the untouched working space (bit-identical to the raw input).
+static inline void deliverInput(const SpeakParams& pr, float r, float g, float b,
+                                float& oR, float& oG, float& oB)
+{
+    if (pr.outputMode == SPEAK_OUT_BAKE_REC709) {
+        const int cs = pr.inputColorSpace;
+        const float lr = decodeToLinear(cs, r);
+        const float lg = decodeToLinear(cs, g);
+        const float lb = decodeToLinear(cs, b);
+        float rr, rg, rb;
+        gamutToRec709Lin(cs, lr, lg, lb, rr, rg, rb);
+        rr = rr < 0.0f ? 0.0f : rr;
+        rg = rg < 0.0f ? 0.0f : rg;
+        rb = rb < 0.0f ? 0.0f : rb;
+        oR = encodeFromLinear(SPEAK_CS_REC709_G24, rr);
+        oG = encodeFromLinear(SPEAK_CS_REC709_G24, rg);
+        oB = encodeFromLinear(SPEAK_CS_REC709_G24, rb);
+    } else {
+        oR = r; oG = g; oB = b;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The whole per-pixel operation. `x,y` are buffer coords (y up, OFX-native);
 // the scope converts to display space internally. RGBA in -> RGBA out (alpha
@@ -351,9 +376,11 @@ static inline void processPixel(float r, float g, float b,
         }
     }
 
-    // View modes (Split / Input) operate on the buffer coordinate.
-    if (pr.viewMode == SPEAK_VIEW_INPUT) { outR = r; outG = g; outB = b; }
-    else if (pr.viewMode == SPEAK_VIEW_SPLIT && x < W / 2) { outR = r; outG = g; outB = b; }
+    // View modes (Split / Input): show the input delivered through the same
+    // output CST, so a Split isolates the LOOK, not the color space.
+    if (pr.viewMode == SPEAK_VIEW_INPUT ||
+        (pr.viewMode == SPEAK_VIEW_SPLIT && x < W / 2))
+        deliverInput(pr, r, g, b, outR, outG, outB);
 
     // Scopes render last, over any view.
     float sr, sg, sb;

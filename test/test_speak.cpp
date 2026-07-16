@@ -263,6 +263,43 @@ static void gateBakeCST()
           (std::string("maxErr=") + std::to_string(maxErr)).c_str());
 }
 
+// ------------------------------------------------------ G9 view delivery CST
+static void gateViewDelivery()
+{
+    printf("G9 view overrides deliver through the output CST\n");
+    const float encGray = diEncode(k18Gray);              // DI 18% gray ~= 0.336
+    const float rec709Gray = std::pow(k18Gray, 1.0f / 2.4f); // Rec.709 ~= 0.489
+
+    // Bake + Input view: shows the input DELIVERED to Rec.709 (no look) — a
+    // valid "before" in the same space as the result, NOT the raw DI buffer
+    // (that would put the two Split halves in different color spaces).
+    SpeakParams pr = {};
+    pr.inputColorSpace = SPEAK_CS_DWG_INTERMEDIATE;
+    pr.outputMode = SPEAK_OUT_BAKE_REC709;
+    pr.enableTone = 1; pr.strength = 1.0f;                // look on, but Input shows input w/o look
+    pr.viewMode = SPEAK_VIEW_INPUT;
+    pr.profile = neutralProfile();
+    float oR, oG, oB;
+    processPixel(encGray, encGray, encGray, 4, 4, 100, 100, pr, oR, oG, oB);
+    check(std::fabs(oR - rec709Gray) < 3e-3f, "bake+Input shows input in Rec.709",
+          (std::string("got=") + std::to_string(oR) + " want=" + std::to_string(rec709Gray)).c_str());
+    check(std::fabs(oR - encGray) > 0.1f, "bake+Input is NOT the raw DI buffer");
+
+    // Working + Input view: bit-exact raw input pass-through.
+    pr.outputMode = SPEAK_OUT_WORKING;
+    processPixel(encGray, encGray, encGray, 4, 4, 100, 100, pr, oR, oG, oB);
+    check(oR == encGray, "working+Input is bit-exact raw input");
+
+    // Bake + Split: left half (input) and right half (result) share Rec.709 —
+    // the left-half pixel equals the delivered input, the right-half is baked.
+    pr.outputMode = SPEAK_OUT_BAKE_REC709; pr.viewMode = SPEAK_VIEW_SPLIT;
+    float lR, lG, lB, rR, rG, rB;
+    processPixel(encGray, encGray, encGray, 10, 4, 100, 100, pr, lR, lG, lB);  // x<W/2 -> input
+    processPixel(encGray, encGray, encGray, 90, 4, 100, 100, pr, rR, rG, rB);  // x>=W/2 -> result
+    check(std::fabs(lR - rec709Gray) < 3e-3f, "bake+Split left half is delivered input (Rec.709)");
+    check(std::fabs(rR - rec709Gray) < 6e-3f, "bake+Split right half is result (Rec.709, same space)");
+}
+
 int main()
 {
     printf("=== Speak CPU gate suite ===\n");
@@ -274,6 +311,7 @@ int main()
     gateGrayPivot();
     gateScopeMatchesKernel();
     gateBakeCST();
+    gateViewDelivery();
     printf("\n%s (%d failures)\n", g_fail ? "FAILED" : "ALL GATES GREEN", g_fail);
     return g_fail ? 1 : 0;
 }

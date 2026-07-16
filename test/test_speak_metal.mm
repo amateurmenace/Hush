@@ -266,6 +266,39 @@ int main()
       runHot(device, queue, 320, 240,  p, "halation size back to 320x240", 0);
       runHot(device, queue, 960, 540,  p, "halation size 960x540", 0); }
 
+    // ------------------------------------------------------------- 8 grain
+    // Per-pixel pure (hash + lattice), so no new buffers — but the uint hash,
+    // the variance-normalized lattice and the density round-trip must agree
+    // bit-for-bit-ish across backends, and the matte path reads INPUT ALPHA
+    // (makeFrame's alpha is a ramp, so the matte modulation varies per pixel).
+    printf("  -- grain (density-domain, matte-keyed) --\n");
+    { SpeakParams p = baseParams(); p.enableGrain = 1; p.profile.grainAmount = 0.0f;
+      run(device, queue, W, H, p, "grain amount 0 (skip path)", 0); }
+    { SpeakParams p = baseParams(); p.enableGrain = 1; p.profile.grainAmount = 0.7f;
+      p.frameIndex = 12;
+      run(device, queue, W, H, p, "grain s0.7 fine", 0); }
+    { SpeakParams p = baseParams(); p.enableGrain = 1; p.profile.grainAmount = 0.7f;
+      p.profile.grainSize = 0.45f; p.frameIndex = 12;
+      run(device, queue, W, H, p, "grain coarse 0.45%", 0); }
+    { SpeakParams p = baseParams(); p.enableGrain = 1; p.profile.grainAmount = 0.7f;
+      p.frameIndex = 13;
+      run(device, queue, W, H, p, "grain next frame (boils)", 0); }
+    { SpeakParams p = baseParams(); p.enableGrain = 1; p.profile.grainAmount = 0.7f;
+      p.grainMatte = 1; p.grainMatteFloor = 0.3f; p.frameIndex = 12;
+      run(device, queue, W, H, p, "grain + alpha-ramp matte", 0); }
+    { SpeakParams p = baseParams(); p.enableGrain = 1; p.profile.grainAmount = 0.7f;
+      p.viewMode = SPEAK_VIEW_GRAIN; p.frameIndex = 12;
+      run(device, queue, W, H, p, "grain isolated view", 0); }
+    { SpeakParams p = baseParams(); p.enableGrain = 1; p.profile.grainAmount = 0.5f;
+      p.strength = 0.0f; p.enableTone = 0;
+      run(device, queue, W, H, p, "grain standalone (no spine)", 0); }
+    { SpeakParams p = halParams(0.9f, 1.5f); p.enableGrain = 1;
+      p.profile.grainAmount = 0.6f; p.grainMatte = 1; p.grainMatteFloor = 0.35f;
+      p.enableDye = 1; p.profile.subSat[0] = p.profile.subSat[1] = p.profile.subSat[2] = 0.5f;
+      speakcore::setDyeCoupler(p.profile, 0.6f);
+      p.scopeDensity = 1;
+      runHot(device, queue, W, H, p, "halation + grain + dye + parade", 1); }
+
     printf("\n%s (%d failures)\n", g_fail ? "PARITY FAILED" : "PARITY GREEN", g_fail);
     return g_fail ? 1 : 0;
 }

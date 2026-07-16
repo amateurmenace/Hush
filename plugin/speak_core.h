@@ -612,6 +612,132 @@ static inline void halAccumPixel(float* arena, int W, int H, int L, int nLev,
 }
 
 // ---------------------------------------------------------------------------
+// GRAIN (Phase 4) — the emulsion's own noise, and the Hush handoff.
+//
+// THE PHYSICS. Film grain is not additive video noise: the developed dye clouds
+// ARE the image, so their randomness is a fluctuation of DENSITY — which
+// multiplies the transmitted light (additive in density == multiplicative in
+// linear, the same identity the split-toning module rests on). And granularity
+// GROWS with density: more dye, more clouds, more fluctuation — which on a
+// POSITIVE print means the shadows are the loud end, exactly the "shadow-loud"
+// behaviour the design study measured on real footage. So:
+//     D_c' = D_c + amount * kGrainScale * sqrt(min(D_c, cap)) * n_c(x, y, frame)
+// applied per RGB DYE LAYER (independent noise per channel — film's layers are
+// separate emulsions) in the density domain of the FINISHED look
+// (print-referred), then viewed back through 10^-D.
+//
+// The sqrt(D) shape is the published granularity-vs-density behaviour family
+// (Selwyn-style RMS granularity rising with density); the constant kGrainScale
+// and the cap are OUR MODELLED DEFAULTS, stated as such — no stock is named and
+// none was measured. Consequences that fall out of the physics rather than
+// being programmed in: paper white is grainless (D -> 0 => sigma -> 0), and the
+// multiplicative form means grain can never push a value negative.
+//
+// HONESTY NOTE, so nobody "fixes" this: multiplicative density noise has a
+// small POSITIVE exposure bias (Jensen: E[10^-(D+s*n)] > 10^-D), ~0.5*(s*ln10)^2
+// relative — ~0.2% at mid-gray at amount 0.5. Real film has the same bias for
+// the same reason. It is measured and bounded by gate G22, not removed.
+//
+// TEMPORAL BEHAVIOUR: independent every frame (the hash includes frameIndex).
+// Real grain boils; correlating it across frames reads as a dirty lens and was
+// explicitly killed in the design study. Gated (G21).
+//
+// THE HUSH HANDOFF (grainMatte): when enabled, the INCOMING ALPHA keys the
+// grain. Hush >= 3.7 with "Export Clean Matte to Alpha" writes its clean-
+// confidence matte there — clamp((effN-1)/6, 0, 1), high where the denoiser
+// averaged deep (texture was flattened: put grain back), low on the motion the
+// gate protected (the real noise survives there: add less on top). Speak reads
+// the [0,1] value as-is; the calibration lives in Hush. grainMatteFloor is the
+// amount kept where the matte is 0. Off by default; with it off, alpha is
+// ignored entirely (gated: G23). Alpha itself passes through untouched either
+// way, so the matte survives Speak for any further node.
+// ---------------------------------------------------------------------------
+static const float kGrainScale = 0.045f;  // sigma_D at D=1, amount=1 (modelled default)
+static const float kGrainDCap  = 4.0f;    // density cap feeding sqrt (deep-shadow safety)
+
+// Integer hash noise in [-1,1] — TEXTUALLY Hush's hashNoise (nr_core.h): pure
+// uint32 math, identical on CPU/Metal/CUDA/OpenCL by construction.
+static inline float grainHash(uint32_t ix, uint32_t iy, uint32_t f, uint32_t ch)
+{
+    uint32_t h = ix * 374761393u + iy * 668265263u + f * 2246822519u + ch * 3266489917u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    h ^= h >> 16;
+    return (static_cast<float>(h & 0xFFFFFFu) / 16777215.0f) * 2.0f - 1.0f;
+}
+
+// Variance-normalized bilinear value noise at a lattice of pitch `size` px.
+// Plain bilinear value noise has a 4:1 VARIANCE ripple between lattice nodes
+// and cell centres (sum of squared weights: 1.0 at a node, 0.25 mid-cell),
+// which reads as a periodic grid stamped on the grain — the same class of
+// artefact G18 caught on the halation pyramid. Dividing by sqrt(sum w^2) makes
+// the variance constant everywhere; the field is still continuous and still
+// lowpass at the lattice scale.
+static inline float grainLattice(float x, float y, float size, uint32_t f, uint32_t ch)
+{
+    const float gx = x / size, gy = y / size;
+    const int ix = static_cast<int>(std::floor(gx)), iy = static_cast<int>(std::floor(gy));
+    const float tx = gx - static_cast<float>(ix), ty = gy - static_cast<float>(iy);
+    const float w00 = (1.0f - tx) * (1.0f - ty), w10 = tx * (1.0f - ty);
+    const float w01 = (1.0f - tx) * ty,          w11 = tx * ty;
+    const float n = w00 * grainHash(static_cast<uint32_t>(ix),     static_cast<uint32_t>(iy),     f, ch)
+                  + w10 * grainHash(static_cast<uint32_t>(ix + 1), static_cast<uint32_t>(iy),     f, ch)
+                  + w01 * grainHash(static_cast<uint32_t>(ix),     static_cast<uint32_t>(iy + 1), f, ch)
+                  + w11 * grainHash(static_cast<uint32_t>(ix + 1), static_cast<uint32_t>(iy + 1), f, ch);
+    const float ww = w00 * w00 + w10 * w10 + w01 * w01 + w11 * w11;
+    return n / std::sqrt(ww);
+}
+
+// The grain field: an octave DIFFERENCE, n_size - n_2size. The subtraction
+// kills the DC and the low-frequency blotch a plain lowpass noise carries (the
+// "grain has a size" claim is a BANDPASS claim: energy at the grain pitch,
+// rolled off both above and below). Different salt per octave so the two are
+// independent; 1/sqrt(2) restores unit-ish sd after the difference.
+static inline float grainBand(float x, float y, float sizePx, uint32_t f, uint32_t ch)
+{
+    return (grainLattice(x, y, sizePx, f, ch) -
+            grainLattice(x, y, sizePx * 2.0f, f, ch + 8u)) * 0.70710678f;
+}
+
+// Grain pitch in px: % of frame height (a physical size on the film scales with
+// the frame, never with pixel count — same format-relative logic as halation),
+// floored at 1 px (a sub-pixel lattice cannot be represented and aliases).
+static inline float grainSizePx(int H, const SpeakParams& pr)
+{
+    const float s = pr.profile.grainSize * 0.01f * static_cast<float>(H);
+    return s < 1.0f ? 1.0f : s;
+}
+static inline bool grainActive(const SpeakParams& pr)
+{
+    return (pr.enableGrain != 0) && (pr.profile.grainAmount > 0.0f);
+}
+
+// Apply grain to the LOOK's working-linear output. `conf` is the pixel's INPUT
+// ALPHA, forwarded by the caller (the pixel path and the scope's measurement
+// pass must forward the SAME value, which is why this stays a pure function of
+// its arguments). It is only read when grainMatte is on, and clamped here.
+static inline void applyGrain(float& r, float& g, float& b, float conf,
+                              int x, int y, int H, const SpeakParams& pr)
+{
+    if (!grainActive(pr)) return;
+    const float sz = grainSizePx(H, pr);
+    const float m  = (pr.grainMatte != 0)
+                   ? lerpf(clampf(pr.grainMatteFloor, 0.0f, 1.0f), 1.0f, clampf(conf, 0.0f, 1.0f))
+                   : 1.0f;
+    const float a  = pr.profile.grainAmount * m * kGrainScale;
+    if (a <= 0.0f) return;
+    const uint32_t fr = static_cast<uint32_t>(pr.frameIndex);
+    const float fx = static_cast<float>(x), fy = static_cast<float>(y);
+    float* ch3[3] = { &r, &g, &b };
+    for (int c = 0; c < 3; ++c) {
+        const float D = density10(*ch3[c]);
+        const float Dc = D < 0.0f ? 0.0f : (D > kGrainDCap ? kGrainDCap : D);
+        const float sigmaD = a * std::sqrt(Dc);
+        const float n = grainBand(fx, fy, sz, fr, static_cast<uint32_t>(c));
+        *ch3[c] = pow10f(-(D + sigmaD * n));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Live H&D curve scope (deterministic — a pure function of the params, so it is
 // parity-trivial). The curves are drawn by evaluating the SAME production
 // hdCurve()/chainDensity() the pixels use, so the plot can never disagree with
@@ -726,6 +852,10 @@ inline void computeStats(const float* src, const float* scat, int W, int H,
                 lookLinear(src[i], src[i + 1], src[i + 2],
                            scat ? scat[j + 0] : 0.0f, scat ? scat[j + 1] : 0.0f,
                            scat ? scat[j + 2] : 0.0f, pr, mr, mg, mb);
+                // Grain is part of the result, so the parade must measure it —
+                // the same L3 rule the halation scatter established (G17). The
+                // matte value comes from the SAME input alpha the pixels use.
+                applyGrain(mr, mg, mb, src[i + 3], x, y, H, pr);
                 const int col = wfColOf(x, W);
                 stats[wfIdx(0, col, wfRowOf(density10(mr)))]++;
                 stats[wfIdx(1, col, wfRowOf(density10(mg)))]++;
@@ -936,7 +1066,7 @@ static inline void deliverInput(const SpeakParams& pr, float r, float g, float b
 // the scope converts to display space internally. RGBA in -> RGBA out (alpha
 // passes through). This is the ONE function the four backends must agree on.
 // ---------------------------------------------------------------------------
-static inline void processPixel(float r, float g, float b,
+static inline void processPixel(float r, float g, float b, float srcA,
                                 float scatR, float scatG, float scatB,
                                 int x, int y, int W, int H,
                                 const SpeakParams& pr, const uint32_t* stats,
@@ -947,18 +1077,20 @@ static inline void processPixel(float r, float g, float b,
     const bool toneOn  = (pr.enableTone != 0) && (pr.strength > 0.0f);
     const bool dyeOn   = (pr.enableDye != 0) && dyeActive(p);
     const bool splitOn = (pr.enableSplit != 0) && splitActive(p);
+    const bool grainOn = grainActive(pr);
     const bool bake    = (pr.outputMode == SPEAK_OUT_BAKE_REC709);
 
-    if (!toneOn && !dyeOn && !splitOn && !bake) {
+    if (!toneOn && !dyeOn && !splitOn && !grainOn && !bake) {
         // Working space + no look: bit-exact pass-through (identity). Scopes
         // may still overwrite below. Halation cannot reach here: halActive()
         // requires toneOn, so this branch already excludes it.
         outR = r; outG = g; outB = b;
     } else {
         // The look in working-space linear (halation + tone spine + subtractive
-        // color) — the SAME function the density scope measures.
+        // color + grain) — the SAME functions the density scope measures.
         float mr, mg, mb;
         lookLinear(r, g, b, scatR, scatG, scatB, pr, mr, mg, mb);
+        applyGrain(mr, mg, mb, srcA, x, y, H, pr);
         if (bake) {
             // Output CST: gamut-convert to Rec.709 and encode gamma 2.4. Applies
             // regardless of the look (it is delivery, not a look) — a hard gamut
@@ -1012,6 +1144,39 @@ static inline void processPixel(float r, float g, float b,
             outR = encodeFromLinear(cs, sr);
             outG = encodeFromLinear(cs, sg);
             outB = encodeFromLinear(cs, sb);
+        }
+    }
+
+    // Isolated-grain view (spec 1B: "show grain-only" — the transparency ethic).
+    // 18% gray plus the EXACT grain increment this pixel received: the look is
+    // run with and without applyGrain and the linear difference sits on gray,
+    // delivered through the same output transform as the picture. Same honesty
+    // stance as the scatter view — never auto-gained, so subtle grain correctly
+    // looks subtle, and the matte's placement (grainMatte) is directly visible.
+    if (pr.viewMode == SPEAK_VIEW_GRAIN) {
+        float pr0, pg0, pb0, pr1, pg1, pb1;
+        lookLinear(r, g, b, scatR, scatG, scatB, pr, pr0, pg0, pb0);
+        pr1 = pr0; pg1 = pg0; pb1 = pb0;
+        applyGrain(pr1, pg1, pb1, srcA, x, y, H, pr);
+        float gr = k18Gray + (pr1 - pr0);
+        float gg = k18Gray + (pg1 - pg0);
+        float gb = k18Gray + (pb1 - pb0);
+        if (bake) {
+            float rr, rg, rb;
+            gamutToRec709Lin(cs, gr, gg, gb, rr, rg, rb);
+            gr = rr < 0.0f ? 0.0f : rr;
+            gg = rg < 0.0f ? 0.0f : rg;
+            gb = rb < 0.0f ? 0.0f : rb;
+            outR = encodeFromLinear(SPEAK_CS_REC709_G24, gr);
+            outG = encodeFromLinear(SPEAK_CS_REC709_G24, gg);
+            outB = encodeFromLinear(SPEAK_CS_REC709_G24, gb);
+        } else {
+            gr = gr < 0.0f ? 0.0f : gr;
+            gg = gg < 0.0f ? 0.0f : gg;
+            gb = gb < 0.0f ? 0.0f : gb;
+            outR = encodeFromLinear(cs, gr);
+            outG = encodeFromLinear(cs, gg);
+            outB = encodeFromLinear(cs, gb);
         }
     }
 
@@ -1095,13 +1260,13 @@ inline void speakFrame(const float* src, int W, int H, const SpeakParams& pr, fl
             const size_t i = (static_cast<size_t>(y) * W + x) * 4;
             const size_t j = (static_cast<size_t>(y) * W + x) * 3;
             float oR, oG, oB;
-            processPixel(src[i + 0], src[i + 1], src[i + 2],
+            processPixel(src[i + 0], src[i + 1], src[i + 2], src[i + 3],
                          sc ? sc[j + 0] : 0.0f, sc ? sc[j + 1] : 0.0f, sc ? sc[j + 2] : 0.0f,
                          x, y, W, H, pr, stats.data(), oR, oG, oB);
             dst[i + 0] = oR;
             dst[i + 1] = oG;
             dst[i + 2] = oB;
-            dst[i + 3] = src[i + 3];   // alpha passes through
+            dst[i + 3] = src[i + 3];   // alpha passes through (the matte survives Speak)
         }
     }
 }
@@ -1138,6 +1303,10 @@ static inline SpeakProfile neutralProfile()
     // ~1% of a Super-35 frame. That sets the ORDER of the default; it is not a
     // precision claim, and the hint does not make one.
     p.halAmount = 0.0f; p.halRadius = 1.0f; p.halThresh = 0.6f;
+    // Grain: OFF by default (amount 0 => bit-exact identity). The size default
+    // is a fine-grain pitch of 0.10% of frame height (~1.1 px at 1080p, ~2.2 px
+    // at UHD — the same physical size on the frame at both, which is the point).
+    p.grainAmount = 0.0f; p.grainSize = 0.10f;
     p.systemGamma = 1.6f; p.residualLUT = 0; p.profileVersion = 1; p._pad0 = 0;
     return p;
 }

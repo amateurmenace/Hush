@@ -420,6 +420,72 @@ __device__ inline void lookLinear(float r, float g, float b,
     oR = mr; oG = mg; oB = mb;
 }
 
+// ---- Grain (Phase 4) — see speak_core.h for the physics and the gates ----
+#define kGrainScale 0.045f
+#define kGrainDCap  4.0f
+
+__device__ inline float grainHash(unsigned int ix, unsigned int iy, unsigned int f, unsigned int ch)
+{
+    unsigned int h = ix * 374761393u + iy * 668265263u + f * 2246822519u + ch * 3266489917u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    h ^= h >> 16;
+    return ((float)(h & 0xFFFFFFu) / 16777215.0f) * 2.0f - 1.0f;
+}
+// Variance-normalized bilinear value noise (constant variance everywhere —
+// plain bilinear has a 4:1 variance ripple that reads as a lattice grid).
+__device__ inline float grainLattice(float x, float y, float size, unsigned int f, unsigned int ch)
+{
+    float gx = x / size, gy = y / size;
+    int ix = (int)floorf(gx), iy = (int)floorf(gy);
+    float tx = gx - (float)ix, ty = gy - (float)iy;
+    float w00 = (1.0f - tx) * (1.0f - ty), w10 = tx * (1.0f - ty);
+    float w01 = (1.0f - tx) * ty,          w11 = tx * ty;
+    float n = w00 * grainHash((unsigned int)ix,       (unsigned int)iy,       f, ch)
+            + w10 * grainHash((unsigned int)(ix + 1), (unsigned int)iy,       f, ch)
+            + w01 * grainHash((unsigned int)ix,       (unsigned int)(iy + 1), f, ch)
+            + w11 * grainHash((unsigned int)(ix + 1), (unsigned int)(iy + 1), f, ch);
+    float ww = w00 * w00 + w10 * w10 + w01 * w01 + w11 * w11;
+    return n / sqrtf(ww);
+}
+// Octave-difference bandpass: kills DC/low-freq blotch; "grain has a size".
+__device__ inline float grainBand(float x, float y, float sizePx, unsigned int f, unsigned int ch)
+{
+    return (grainLattice(x, y, sizePx, f, ch) -
+            grainLattice(x, y, sizePx * 2.0f, f, ch + 8u)) * 0.70710678f;
+}
+__device__ inline float grainSizePx(int H, const SpeakParams& pr)
+{
+    float s = pr.profile.grainSize * 0.01f * (float)H;
+    return s < 1.0f ? 1.0f : s;
+}
+__device__ inline bool grainActive(const SpeakParams& pr)
+{
+    return (pr.enableGrain != 0) && (pr.profile.grainAmount > 0.0f);
+}
+// Density-domain grain on the look's working-linear output. `conf` = the
+// pixel's INPUT ALPHA (only read when grainMatte is on; clamped here).
+__device__ inline void applyGrain(float& r, float& g, float& b, float conf,
+                                  int x, int y, int H, const SpeakParams& pr)
+{
+    if (!grainActive(pr)) return;
+    float sz = grainSizePx(H, pr);
+    float m = (pr.grainMatte != 0)
+            ? lerpf(clampf(pr.grainMatteFloor, 0.0f, 1.0f), 1.0f, clampf(conf, 0.0f, 1.0f))
+            : 1.0f;
+    float a = pr.profile.grainAmount * m * kGrainScale;
+    if (a <= 0.0f) return;
+    unsigned int fr = (unsigned int)pr.frameIndex;
+    float fx = (float)x, fy = (float)y;
+    for (int c = 0; c < 3; ++c) {
+        float* ch = (c == 0) ? &r : ((c == 1) ? &g : &b);
+        float D = density10(*ch);
+        float Dc = D < 0.0f ? 0.0f : (D > kGrainDCap ? kGrainDCap : D);
+        float sigmaD = a * sqrtf(Dc);
+        float n = grainBand(fx, fy, sz, fr, (unsigned int)c);
+        *ch = pow10f(-(D + sigmaD * n));
+    }
+}
+
 __device__ inline float scopeYStops(float inStops, int ch, const SpeakParams& pr)
 {
     float lin = k18Gray * exp2f(inStops);
@@ -568,7 +634,7 @@ __device__ inline void deliverInput(const SpeakParams& pr, float r, float g, flo
     }
 }
 
-__device__ inline void processPixel(float r, float g, float b,
+__device__ inline void processPixel(float r, float g, float b, float srcA,
                                     float scatR, float scatG, float scatB,
                                     int x, int y, int W, int H,
                                     const SpeakParams& pr, const unsigned int* stats,
@@ -578,13 +644,15 @@ __device__ inline void processPixel(float r, float g, float b,
     bool toneOn = (pr.enableTone != 0) && (pr.strength > 0.0f);
     bool dyeOn = (pr.enableDye != 0) && dyeActive(pr.profile);
     bool splitOn = (pr.enableSplit != 0) && splitActive(pr.profile);
+    bool grainOn = grainActive(pr);
     bool bake = (pr.outputMode == 1);
-    if (!toneOn && !dyeOn && !splitOn && !bake) {
+    if (!toneOn && !dyeOn && !splitOn && !grainOn && !bake) {
         // Halation cannot reach here: halActive() requires toneOn.
         outR = r; outG = g; outB = b;
     } else {
         float mr, mg, mb;
         lookLinear(r, g, b, scatR, scatG, scatB, pr, mr, mg, mb);
+        applyGrain(mr, mg, mb, srcA, x, y, H, pr);
         if (bake) {
             float rr, rg, rb;
             gamutToRec709Lin(cs, mr, mg, mb, rr, rg, rb);
@@ -625,6 +693,35 @@ __device__ inline void processPixel(float r, float g, float b,
             outR = encodeFromLinear(cs, sr);
             outG = encodeFromLinear(cs, sg);
             outB = encodeFromLinear(cs, sb);
+        }
+    }
+
+    // Isolated-grain view: 18% gray + the EXACT grain increment this pixel
+    // received, through the same output transform. Never auto-gained.
+    if (pr.viewMode == 4) {
+        float pr0, pg0, pb0, pr1, pg1, pb1;
+        lookLinear(r, g, b, scatR, scatG, scatB, pr, pr0, pg0, pb0);
+        pr1 = pr0; pg1 = pg0; pb1 = pb0;
+        applyGrain(pr1, pg1, pb1, srcA, x, y, H, pr);
+        float gr = k18Gray + (pr1 - pr0);
+        float gg = k18Gray + (pg1 - pg0);
+        float gb = k18Gray + (pb1 - pb0);
+        if (bake) {
+            float rr, rg, rb;
+            gamutToRec709Lin(cs, gr, gg, gb, rr, rg, rb);
+            gr = rr < 0.0f ? 0.0f : rr;
+            gg = rg < 0.0f ? 0.0f : rg;
+            gb = rb < 0.0f ? 0.0f : rb;
+            outR = encodeFromLinear(1, gr);
+            outG = encodeFromLinear(1, gg);
+            outB = encodeFromLinear(1, gb);
+        } else {
+            gr = gr < 0.0f ? 0.0f : gr;
+            gg = gg < 0.0f ? 0.0f : gg;
+            gb = gb < 0.0f ? 0.0f : gb;
+            outR = encodeFromLinear(cs, gr);
+            outG = encodeFromLinear(cs, gg);
+            outB = encodeFromLinear(cs, gb);
         }
     }
 
@@ -743,6 +840,8 @@ __global__ void SpeakStatsKernel(SpeakParams p, int W, int H,
         lookLinear(s.x, s.y, s.z,
                    scat ? scat[j + 0] : 0.0f, scat ? scat[j + 1] : 0.0f,
                    scat ? scat[j + 2] : 0.0f, p, mr, mg, mb);
+        // Grain is part of the result, so the parade measures it (G17's rule).
+        applyGrain(mr, mg, mb, s.w, x, y, H, p);
         int col = wfColOf(x, W);
         atomicAdd(&stats[wfIdx(0, col, wfRowOf(density10(mr)))], 1u);
         atomicAdd(&stats[wfIdx(1, col, wfRowOf(density10(mg)))], 1u);
@@ -773,7 +872,7 @@ __global__ void SpeakKernel(SpeakParams p, int W, int H,
     size_t j = ((size_t)y * W + x) * 3;
     float4 s = src[i];
     float oR, oG, oB;
-    processPixel(s.x, s.y, s.z,
+    processPixel(s.x, s.y, s.z, s.w,
                  scat ? scat[j + 0] : 0.0f, scat ? scat[j + 1] : 0.0f,
                  scat ? scat[j + 2] : 0.0f,
                  x, y, W, H, p, stats, oR, oG, oB);

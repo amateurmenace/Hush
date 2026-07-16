@@ -264,6 +264,26 @@ int main()
         printf("  [SKIP] scope H&D / density / both    (device's OpenCL atomics are broken)\n");
     }
 
+    /* ---- grain: per-pixel pure, atomics-free, runs everywhere ---- */
+    { SpeakParams p = baseParams(); p.enableGrain = 1; p.profile.grainAmount = 0.7f;
+      p.frameIndex = 12;
+      run(W, H, p, "grain s0.7 fine", 0); }
+    { SpeakParams p = baseParams(); p.enableGrain = 1; p.profile.grainAmount = 0.7f;
+      p.profile.grainSize = 0.45f; p.frameIndex = 12;
+      run(W, H, p, "grain coarse 0.45%", 0); }
+    { SpeakParams p = baseParams(); p.enableGrain = 1; p.profile.grainAmount = 0.7f;
+      p.grainMatte = 1; p.grainMatteFloor = 0.3f; p.frameIndex = 12;
+      run(W, H, p, "grain + alpha-ramp matte", 0); }
+    { SpeakParams p = baseParams(); p.enableGrain = 1; p.profile.grainAmount = 0.7f;
+      p.viewMode = SPEAK_VIEW_GRAIN; p.frameIndex = 12;
+      run(W, H, p, "grain isolated view", 0); }
+    { SpeakParams p = baseParams(); p.enableGrain = 1; p.profile.grainAmount = 0.5f;
+      p.strength = 0.0f; p.enableTone = 0;
+      run(W, H, p, "grain standalone (no spine)", 0); }
+    { SpeakParams p = halParams(); p.enableGrain = 1; p.profile.grainAmount = 0.6f;
+      p.grainMatte = 1; p.grainMatteFloor = 0.35f;
+      runHot(W, H, p, "halation + grain + matte", 0); }
+
     printf("\n%s (%d failures)\n", g_fail ? "PARITY FAILED" : "PARITY GREEN", g_fail);
     return g_fail ? 1 : 0;
 }

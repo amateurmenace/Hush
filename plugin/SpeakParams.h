@@ -85,6 +85,14 @@ typedef struct SpeakProfile
     float halRadius;      // scatter radius as % of FRAME HEIGHT (format-relative)
     float halThresh;      // scene-linear highlight threshold that feeds the scatter
 
+    // ---- Grain (Phase 4) ----
+    // Film grain is DENSITY noise: the dye clouds ARE the image, so the noise
+    // multiplies light rather than adding to it. Applied in the density domain
+    // of the finished look (print-referred), per RGB dye layer, independent
+    // every frame. See speak_core.h applyGrain for the physics and the gates.
+    float grainAmount;    // 0 = off (bit-exact identity)
+    float grainSize;      // grain pitch as % of FRAME HEIGHT (format-relative)
+
     // ---- meta ----
     float systemGamma;    // target overall system gamma (~1.6), for the scope
     int   residualLUT;    // 0 = separable model only, 1 = 3D residual cube on
@@ -115,6 +123,7 @@ typedef struct SpeakProfile
 #define SPEAK_VIEW_SPLIT          1   // input | result
 #define SPEAK_VIEW_INPUT          2
 #define SPEAK_VIEW_SCATTER        3   // the isolated halation scatter field
+#define SPEAK_VIEW_GRAIN          4   // gray + the grain increment, isolated
 
 typedef struct SpeakParams
 {
@@ -135,6 +144,13 @@ typedef struct SpeakParams
     int   scopeHD;         // live H&D characteristic-curve scope
     int   scopeDensity;    // Status-M density waveform scope
     int   scopeVector;     // subtractive-sat vector field (Phase 2)
+
+    // ---- grain pipeline controls (NOT stock properties, so params-level) ----
+    int   enableGrain;     // the grain stage's own toggle
+    int   grainMatte;      // 1 = key grain on the INCOMING ALPHA (Hush's clean-
+                           // confidence matte: clamp((effN-1)/6), high = cleaned)
+    float grainMatteFloor; // grain amount where the matte is 0 (motion) — the
+                           // real noise is still there, so add less on top
 
     SpeakProfile profile;
 } SpeakParams;

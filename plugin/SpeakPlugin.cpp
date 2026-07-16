@@ -37,7 +37,7 @@
     "Hush quiets the noise; Speak gives the image its voice. MIT-licensed, free."
 #define kSpeakIdentifier "org.opennr.Speak"
 #define kSpeakVersionMajor 0
-#define kSpeakVersionMinor 1
+#define kSpeakVersionMinor 2
 
 #define kSupportsTiles false
 #define kSupportsMultiResolution false
@@ -145,6 +145,11 @@ public:
         m_HalAmount     = fetchDoubleParam("halAmount");
         m_HalRadius     = fetchDoubleParam("halRadius");
         m_HalThresh     = fetchDoubleParam("halThresh");
+        m_EnableGrain   = fetchBooleanParam("enableGrain");
+        m_GrainAmount   = fetchDoubleParam("grainAmount");
+        m_GrainSize     = fetchDoubleParam("grainSize");
+        m_GrainMatte    = fetchBooleanParam("grainMatte");
+        m_GrainMatteFloor = fetchDoubleParam("grainMatteFloor");
         m_ViewMode      = fetchChoiceParam("viewMode");
         m_ScopeHD       = fetchBooleanParam("scopeHD");
         m_ScopeDensity  = fetchBooleanParam("scopeDensity");
@@ -178,14 +183,18 @@ public:
                               m_SplitHighG->getValueAtTime(t) != 0.0 || m_SplitHighB->getValueAtTime(t) != 0.0);
         // Halation only exists inside the tone spine (it re-exposes the
         // negative), so it cannot make the node non-identity on its own.
-        if (!toneOn && !dyeOn && !splitOn) { p_IdentityClip = m_SrcClip; p_IdentityTime = t; return true; }
+        // Grain CAN: it is emulsion noise on whatever image arrives, standalone
+        // like dye/split.
+        const bool grainOn = m_EnableGrain->getValueAtTime(t) && (m_GrainAmount->getValueAtTime(t) > 0.0);
+        if (!toneOn && !dyeOn && !splitOn && !grainOn) { p_IdentityClip = m_SrcClip; p_IdentityTime = t; return true; }
         return false;
     }
 
     virtual void changedParam(const OFX::InstanceChangedArgs& /*p_Args*/, const std::string& p_ParamName)
     {
         if (p_ParamName == "enableTone" || p_ParamName == "enableDye" ||
-            p_ParamName == "enableSplit" || p_ParamName == "enableOptics") updateEnabledness();
+            p_ParamName == "enableSplit" || p_ParamName == "enableOptics" ||
+            p_ParamName == "enableGrain" || p_ParamName == "grainMatte") updateEnabledness();
     }
 
 private:
@@ -219,6 +228,11 @@ private:
         const bool op = m_EnableOptics->getValue() && m_EnableTone->getValue();
         m_HalAmount->setEnabled(op); m_HalRadius->setEnabled(op); m_HalThresh->setEnabled(op);
         m_EnableOptics->setEnabled(m_EnableTone->getValue());
+        // Grain is standalone (no spine required): gated on its own enable only,
+        // and the matte floor additionally on the matte toggle.
+        const bool gr = m_EnableGrain->getValue();
+        m_GrainAmount->setEnabled(gr); m_GrainSize->setEnabled(gr); m_GrainMatte->setEnabled(gr);
+        m_GrainMatteFloor->setEnabled(gr && m_GrainMatte->getValue());
     }
 
     SpeakParams gatherParams(double t)
@@ -282,6 +296,14 @@ private:
         prof.halAmount = static_cast<float>(m_HalAmount->getValueAtTime(t));
         prof.halRadius = static_cast<float>(m_HalRadius->getValueAtTime(t));
         prof.halThresh = static_cast<float>(m_HalThresh->getValueAtTime(t));
+
+        // Grain (Phase 4): density-domain emulsion noise, optionally keyed on
+        // the incoming alpha (Hush's clean-confidence matte).
+        p.enableGrain      = m_EnableGrain->getValueAtTime(t) ? 1 : 0;
+        p.grainMatte       = m_GrainMatte->getValueAtTime(t) ? 1 : 0;
+        p.grainMatteFloor  = static_cast<float>(m_GrainMatteFloor->getValueAtTime(t));
+        prof.grainAmount   = static_cast<float>(m_GrainAmount->getValueAtTime(t));
+        prof.grainSize     = static_cast<float>(m_GrainSize->getValueAtTime(t));
 
         p.profile = prof;
         return p;
@@ -370,6 +392,11 @@ private:
     OFX::DoubleParam*  m_HalAmount;
     OFX::DoubleParam*  m_HalRadius;
     OFX::DoubleParam*  m_HalThresh;
+    OFX::BooleanParam* m_EnableGrain;
+    OFX::DoubleParam*  m_GrainAmount;
+    OFX::DoubleParam*  m_GrainSize;
+    OFX::BooleanParam* m_GrainMatte;
+    OFX::DoubleParam*  m_GrainMatteFloor;
     OFX::ChoiceParam*  m_ViewMode;
     OFX::BooleanParam* m_ScopeHD;
     OFX::BooleanParam* m_ScopeDensity;
@@ -614,9 +641,42 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
                "keeping the effect in the highlights, not a property of film — real emulsion "
                "scatters every photon.", 0.6, 0.0, 8.0, 0.01, grpLight);
 
+    // ---------------------------------------------------------------- 6 · Grain
+    // Standalone (no spine required): grain is the emulsion's own noise on
+    // whatever image arrives. Density-domain, per dye layer, boils every frame.
+    OFX::GroupParamDescriptor* grpGrain = p_Desc.defineGroupParam("grpGrain");
+    grpGrain->setLabels("6 \xC2\xB7 Grain", "6 \xC2\xB7 Grain", "6 \xC2\xB7 Grain");
+    grpGrain->setOpen(true);
+    grpGrain->setHint("Film grain as DENSITY noise: the dye clouds are the image, so grain "
+                      "multiplies light instead of adding video noise on top - shadows are loud, "
+                      "paper white is grainless, and no value can go negative. Independent every "
+                      "frame (real grain boils). Set View to Grain to see exactly what is added.");
+
+    sDefBool(p_Desc, page, "enableGrain", "Enable Grain",
+             "Toggle the grain stage to compare.", false, grpGrain);
+    sDefDouble(p_Desc, page, "grainAmount", "Grain",
+               "Granularity: the RMS density fluctuation, rising with density (sqrt(D), the "
+               "published granularity-vs-density behaviour family; the scale constant is our "
+               "modelled default, not a measured stock). 0 = off, bit-exact.",
+               0.0, 0.0, 1.0, 0.01, grpGrain);
+    sDefDouble(p_Desc, page, "grainSize", "Grain Size",
+               "Grain pitch as a percentage of frame HEIGHT, so the physical size holds from "
+               "proxy to full res. 0.10 is a fine 35mm-scan feel (~2px at UHD); bigger reads "
+               "as faster, chunkier stock.", 0.10, 0.05, 0.60, 0.01, grpGrain);
+    sDefBool(p_Desc, page, "grainMatte", "Use Incoming Matte (Alpha)",
+             "Keys the grain on the INCOMING ALPHA: full grain where alpha is 1, the Floor "
+             "where it is 0. Pair with Hush 3.7's \"Export Clean Matte to Alpha\" to lay grain "
+             "exactly where the denoiser cleaned deepest and less where real noise survives. "
+             "Off = alpha is ignored. Alpha always passes through untouched.",
+             false, grpGrain);
+    sDefDouble(p_Desc, page, "grainMatteFloor", "Matte Floor",
+               "Grain amount where the matte is 0 (protected motion). The real noise is still "
+               "there, so a little added grain usually blends better than none.",
+               0.35, 0.0, 1.0, 0.01, grpGrain);
+
     // -------------------------------------------------------------- 6 · Inspect
     OFX::GroupParamDescriptor* grpInspect = p_Desc.defineGroupParam("grpInspect");
-    grpInspect->setLabels("6 \xC2\xB7 Inspect", "6 \xC2\xB7 Inspect", "6 \xC2\xB7 Inspect");
+    grpInspect->setLabels("7 \xC2\xB7 Inspect", "7 \xC2\xB7 Inspect", "7 \xC2\xB7 Inspect");
     grpInspect->setOpen(true);
     grpInspect->setHint("Views and the read-only scopes. Turn scopes off before rendering.");
     {
@@ -629,6 +689,7 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
         c->appendOption("Split (Input | Result)");
         c->appendOption("Input (Original)");
         c->appendOption("Halation Scatter (isolated)");
+        c->appendOption("Grain (isolated, on gray)");
         c->setDefault(SPEAK_VIEW_RESULT);
         c->setParent(*grpInspect);
         page->addChild(*c);

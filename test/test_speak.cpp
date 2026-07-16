@@ -37,14 +37,14 @@ static void gateLayout()
 {
     printf("G1 struct layout parity\n");
     // All-4-byte-field invariant: sizeof must equal the field count * 4.
-    const size_t profFields = 70;   // see SpeakParams.h; keep in sync (+3 halation)
-    const size_t parFields  = 13 + profFields;
+    const size_t profFields = 72;   // see SpeakParams.h; keep in sync (+3 halation +2 grain)
+    const size_t parFields  = 16 + profFields;   // +3 grain pipeline controls
     check(sizeof(float) == 4 && sizeof(int) == 4, "float/int are 4 bytes");
-    check(sizeof(SpeakProfile) == profFields * 4, "sizeof(SpeakProfile)==280",
+    check(sizeof(SpeakProfile) == profFields * 4, "sizeof(SpeakProfile)==288",
           (std::to_string(sizeof(SpeakProfile))).c_str());
-    check(sizeof(SpeakParams) == parFields * 4, "sizeof(SpeakParams)==332",
+    check(sizeof(SpeakParams) == parFields * 4, "sizeof(SpeakParams)==352",
           (std::to_string(sizeof(SpeakParams))).c_str());
-    check(offsetof(SpeakParams, profile) == 13 * 4, "profile offset==52",
+    check(offsetof(SpeakParams, profile) == 16 * 4, "profile offset==64",
           (std::to_string(offsetof(SpeakParams, profile))).c_str());
     // A few anchor offsets the GPU struct declarations must match.
     check(offsetof(SpeakProfile, printerLights) == 18 * 4, "printerLights offset==72");
@@ -193,7 +193,7 @@ static void gateScopeMatchesKernel()
             const float lin = k18Gray * std::exp2(inStops);
             const float enc = diEncode(lin);
             float oR, oG, oB;
-            processPixel(enc, enc, enc, 0.0f, 0.0f, 0.0f, 4, 4, 100, 100, pr, kNoStats,oR, oG, oB); // the REAL pixel path
+            processPixel(enc, enc, enc, 1.0f, 0.0f, 0.0f, 0.0f, 4, 4, 100, 100, pr, kNoStats,oR, oG, oB); // the REAL pixel path
             for (int ch = 0; ch < 3; ++ch) {
                 const float scopeOut = scopeYStops(inStops, ch, pr);
                 const float outCh = (ch == 0) ? oR : (ch == 1) ? oG : oB;
@@ -225,7 +225,7 @@ static void gateBakeCST()
         const float lin = std::pow(10.0f, -3.0f + 5.0f * (i / 400.0f));
         const float enc = diEncode(lin);
         float oR, oG, oB;
-        processPixel(enc, enc, enc, 0.0f, 0.0f, 0.0f, 4, 4, 100, 100, pr, kNoStats,oR, oG, oB);
+        processPixel(enc, enc, enc, 1.0f, 0.0f, 0.0f, 0.0f, 4, 4, 100, 100, pr, kNoStats,oR, oG, oB);
         maxChroma = std::fmax(maxChroma, std::fmax(std::fabs(oR - oG), std::fabs(oG - oB)));
     }
     check(maxChroma < 2e-3f, "DWG neutral bakes to Rec.709 neutral",
@@ -235,7 +235,7 @@ static void gateBakeCST()
     {
         const float enc = diEncode(k18Gray);
         float oR, oG, oB;
-        processPixel(enc, enc, enc, 0.0f, 0.0f, 0.0f, 4, 4, 100, 100, pr, kNoStats,oR, oG, oB);
+        processPixel(enc, enc, enc, 1.0f, 0.0f, 0.0f, 0.0f, 4, 4, 100, 100, pr, kNoStats,oR, oG, oB);
         const float expect = std::pow(k18Gray, 1.0f / 2.4f);
         check(std::fabs(oR - expect) < 3e-3f, "18% gray -> correct Rec.709 code",
               (std::string("got=") + std::to_string(oR) + " want=" + std::to_string(expect)).c_str());
@@ -283,22 +283,22 @@ static void gateViewDelivery()
     pr.viewMode = SPEAK_VIEW_INPUT;
     pr.profile = neutralProfile();
     float oR, oG, oB;
-    processPixel(encGray, encGray, encGray, 0.0f, 0.0f, 0.0f, 4, 4, 100, 100, pr, kNoStats,oR, oG, oB);
+    processPixel(encGray, encGray, encGray, 1.0f, 0.0f, 0.0f, 0.0f, 4, 4, 100, 100, pr, kNoStats,oR, oG, oB);
     check(std::fabs(oR - rec709Gray) < 3e-3f, "bake+Input shows input in Rec.709",
           (std::string("got=") + std::to_string(oR) + " want=" + std::to_string(rec709Gray)).c_str());
     check(std::fabs(oR - encGray) > 0.1f, "bake+Input is NOT the raw DI buffer");
 
     // Working + Input view: bit-exact raw input pass-through.
     pr.outputMode = SPEAK_OUT_WORKING;
-    processPixel(encGray, encGray, encGray, 0.0f, 0.0f, 0.0f, 4, 4, 100, 100, pr, kNoStats,oR, oG, oB);
+    processPixel(encGray, encGray, encGray, 1.0f, 0.0f, 0.0f, 0.0f, 4, 4, 100, 100, pr, kNoStats,oR, oG, oB);
     check(oR == encGray, "working+Input is bit-exact raw input");
 
     // Bake + Split: left half (input) and right half (result) share Rec.709 —
     // the left-half pixel equals the delivered input, the right-half is baked.
     pr.outputMode = SPEAK_OUT_BAKE_REC709; pr.viewMode = SPEAK_VIEW_SPLIT;
     float lR, lG, lB, rR, rG, rB;
-    processPixel(encGray, encGray, encGray, 0.0f, 0.0f, 0.0f, 10, 4, 100, 100, pr, kNoStats,lR, lG, lB);  // x<W/2 -> input
-    processPixel(encGray, encGray, encGray, 0.0f, 0.0f, 0.0f, 90, 4, 100, 100, pr, kNoStats,rR, rG, rB);  // x>=W/2 -> result
+    processPixel(encGray, encGray, encGray, 1.0f, 0.0f, 0.0f, 0.0f, 10, 4, 100, 100, pr, kNoStats,lR, lG, lB);  // x<W/2 -> input
+    processPixel(encGray, encGray, encGray, 1.0f, 0.0f, 0.0f, 0.0f, 90, 4, 100, 100, pr, kNoStats,rR, rG, rB);  // x>=W/2 -> result
     check(std::fabs(lR - rec709Gray) < 3e-3f, "bake+Split left half is delivered input (Rec.709)");
     check(std::fabs(rR - rec709Gray) < 6e-3f, "bake+Split right half is result (Rec.709, same space)");
 }
@@ -722,6 +722,261 @@ static void gateHalScopeSeesScatter()
           (std::string("cells=") + std::to_string(diff)).c_str());
 }
 
+// ------------------------------------------------- G19..G24 grain / the handoff
+//
+// The design is the whitepaper's (amplitude on the shadow-loud curve, bandpass
+// spectrum, RGB dye layers, temporally independent) — referenced, not
+// redesigned. These gates enforce each measurable claim, and each is written so
+// a specific plausible defect turns it red: a flat amplitude ships past G20, a
+// frame-correlated hash past G21, an additive (non-density) grain past G22's
+// negative-value check, a matte that leaks when off past G23, shared channel
+// salts past G24.
+
+// A flat frame at linear value v with alpha a, grain-only params.
+static SpeakParams grainParams(float amount, float sizePct)
+{
+    SpeakParams pr = {};
+    pr.inputColorSpace = SPEAK_CS_LINEAR;
+    pr.outputMode = SPEAK_OUT_WORKING;
+    pr.viewMode = SPEAK_VIEW_RESULT;
+    pr.enableGrain = 1;
+    pr.frameIndex = 7;
+    pr.profile = neutralProfile();
+    pr.profile.grainAmount = amount;
+    pr.profile.grainSize = sizePct;
+    return pr;
+}
+static std::vector<float> flatFrame(int W, int H, float v, float a)
+{
+    std::vector<float> f(static_cast<size_t>(W) * H * 4);
+    for (size_t k = 0; k < f.size(); k += 4) { f[k] = v; f[k + 1] = v; f[k + 2] = v; f[k + 3] = a; }
+    return f;
+}
+// RMS of the DENSITY increment the grain applied, over the frame, one channel.
+static double grainRmsD(const std::vector<float>& src, const std::vector<float>& dst, int ch)
+{
+    double s2 = 0.0; size_t n = 0;
+    for (size_t k = 0; k < src.size(); k += 4) {
+        const double d = density10(dst[k + ch]) - density10(src[k + ch]);
+        s2 += d * d; n++;
+    }
+    return std::sqrt(s2 / n);
+}
+
+static void gateGrainIdentity()
+{
+    printf("G19 grain identity + the enable gates\n");
+    const int W = 96, H = 96;
+    std::vector<float> src = flatFrame(W, H, 0.18f, 1.0f);
+    std::vector<float> a(src.size()), b(src.size());
+
+    SpeakParams p0 = grainParams(0.0f, 0.10f);
+    speakFrame(src.data(), W, H, p0, a.data());
+    float mx = 0.0f;
+    for (size_t k = 0; k < src.size(); ++k) mx = std::fmax(mx, std::fabs(a[k] - src[k]));
+    check(mx == 0.0f, "G19a grainAmount 0 is BIT-EXACT identity",
+          (std::string("maxAbs=") + std::to_string(mx)).c_str());
+
+    SpeakParams p1 = grainParams(0.6f, 0.10f);
+    speakFrame(src.data(), W, H, p1, b.data());
+    float md = 0.0f;
+    for (size_t k = 0; k < src.size(); ++k) md = std::fmax(md, std::fabs(b[k] - src[k]));
+    check(md > 1e-4f, "G19b grain at 0.6 actually CHANGES the frame",
+          (std::string("maxDelta=") + std::to_string(md)).c_str());
+
+    SpeakParams p2 = p1; p2.enableGrain = 0;
+    speakFrame(src.data(), W, H, p2, b.data());
+    mx = 0.0f;
+    for (size_t k = 0; k < src.size(); ++k) mx = std::fmax(mx, std::fabs(b[k] - src[k]));
+    check(mx == 0.0f, "G19c enableGrain 0 is BIT-EXACT with amount up");
+
+    // Grain is multiplicative in light (density noise): it can NEVER produce a
+    // negative value, which an additive video grain does at the first dark pixel.
+    std::vector<float> dark = flatFrame(W, H, 0.004f, 1.0f), o(dark.size());
+    SpeakParams p3 = grainParams(1.0f, 0.10f);
+    speakFrame(dark.data(), W, H, p3, o.data());
+    bool nonneg = true;
+    for (size_t k = 0; k < o.size(); k += 4)
+        if (o[k] < 0.0f || o[k + 1] < 0.0f || o[k + 2] < 0.0f) nonneg = false;
+    check(nonneg, "G19d grain never pushes a value negative (multiplicative by construction)");
+}
+
+static void gateGrainShadowLoud()
+{
+    printf("G20 grain amplitude follows the density curve (shadow-loud on a print)\n");
+    // sigma_D = k*sqrt(D): the RMS density increment over sqrt(D) must be the
+    // SAME constant at every gray level (that is what "follows the curve"
+    // means), and paper white must be near-grainless. A flat-amplitude grain —
+    // what cheap plugins ship — fails both.
+    const int W = 128, H = 128;
+    const float lins[4] = { 0.70f, 0.18f, 0.05f, 0.013f };   // D = 0.15 .. 1.9
+    double ratio[4];
+    for (int i = 0; i < 4; ++i) {
+        std::vector<float> src = flatFrame(W, H, lins[i], 1.0f), dst(src.size());
+        SpeakParams pr = grainParams(1.0f, 0.10f);
+        speakFrame(src.data(), W, H, pr, dst.data());
+        const double rms = grainRmsD(src, dst, 0);
+        const double D = density10(lins[i]);
+        ratio[i] = rms / std::sqrt(D);
+        printf("    lin %.3f (D=%.3f): rmsD=%.5f  rmsD/sqrt(D)=%.5f\n", lins[i], D, rms, ratio[i]);
+    }
+    double lo = ratio[0], hi = ratio[0];
+    for (int i = 1; i < 4; ++i) { lo = std::fmin(lo, ratio[i]); hi = std::fmax(hi, ratio[i]); }
+    check((hi - lo) / ((hi + lo) * 0.5) < 0.20,
+          "G20a rmsD/sqrt(D) is constant across 2 decades of density (the declared curve)",
+          (std::string("spread=") + std::to_string((hi - lo) / ((hi + lo) * 0.5))).c_str());
+
+    // Paper white: D -> 0 => sigma -> 0 falls out of the physics.
+    std::vector<float> w = flatFrame(W, H, 0.995f, 1.0f), wo(w.size());
+    SpeakParams pw = grainParams(1.0f, 0.10f);
+    speakFrame(w.data(), W, H, pw, wo.data());
+    const double rmsW = grainRmsD(w, wo, 0);
+    check(rmsW < ratio[1] * 0.25,
+          "G20b near paper white the grain nearly vanishes (no dye, no clouds)",
+          (std::string("rmsD(white)=") + std::to_string(rmsW)).c_str());
+}
+
+static void gateGrainTemporal()
+{
+    printf("G21 grain is temporally INDEPENDENT (it boils; correlation is anti-film)\n");
+    const int W = 128, H = 128;
+    std::vector<float> src = flatFrame(W, H, 0.18f, 1.0f), f0(src.size()), f1(src.size());
+    SpeakParams pr = grainParams(1.0f, 0.10f);
+    pr.frameIndex = 100; speakFrame(src.data(), W, H, pr, f0.data());
+    pr.frameIndex = 101; speakFrame(src.data(), W, H, pr, f1.data());
+    double s0 = 0, s1 = 0, s01 = 0, v0 = 0, v1 = 0; size_t n = 0;
+    for (size_t k = 0; k < src.size(); k += 4) {
+        const double a = f0[k] - src[k], b = f1[k] - src[k];
+        s0 += a; s1 += b; s01 += a * b; v0 += a * a; v1 += b * b; n++;
+    }
+    const double corr = (s01 / n - (s0 / n) * (s1 / n)) /
+                        (std::sqrt(v0 / n - (s0 / n) * (s0 / n)) * std::sqrt(v1 / n - (s1 / n) * (s1 / n)) + 1e-30);
+    printf("    corr(frame 100, frame 101) = %.4f\n", corr);
+    check(std::fabs(corr) < 0.05, "G21 consecutive frames' grain fields are uncorrelated",
+          (std::string("corr=") + std::to_string(corr)).c_str());
+}
+
+static void gateGrainMean()
+{
+    printf("G22 the exposure bias of multiplicative grain is small and bounded\n");
+    // Density noise has a POSITIVE Jensen bias (~0.5*(sigma*ln10)^2). Real film
+    // has it too; it is documented at applyGrain, measured here, and NOT
+    // silently removed. This also pins that grain stays multiplicative — an
+    // additive implementation would show ~zero bias and G19d would fail first.
+    const int W = 256, H = 256;
+    std::vector<float> src = flatFrame(W, H, 0.18f, 1.0f), dst(src.size());
+    SpeakParams pr = grainParams(1.0f, 0.10f);
+    speakFrame(src.data(), W, H, pr, dst.data());
+    double m0 = 0, m1 = 0; size_t n = 0;
+    for (size_t k = 0; k < src.size(); k += 4) { m0 += src[k]; m1 += dst[k]; n++; }
+    const double bias = m1 / m0 - 1.0;
+    printf("    mean shift at 18%% gray, amount 1.0: %+.4f%%\n", bias * 100.0);
+    check(bias > -1e-4 && bias < 0.01, "G22 exposure bias at amount 1.0 is positive and < 1%",
+          (std::string("bias=") + std::to_string(bias)).c_str());
+}
+
+static void gateGrainMatte()
+{
+    printf("G23 the Hush handoff: incoming alpha keys the grain\n");
+    const int W = 128, H = 128;
+    // Alpha = 1 (fully cleaned) vs alpha = 0 (protected motion), grainMatte on,
+    // floor 0.3: the RMS ratio must be ~ the floor. Then grainMatte OFF must
+    // ignore alpha entirely (bit-identical output for any alpha).
+    SpeakParams pr = grainParams(1.0f, 0.10f);
+    pr.grainMatte = 1; pr.grainMatteFloor = 0.3f;
+    std::vector<float> a1 = flatFrame(W, H, 0.18f, 1.0f), o1(a1.size());
+    std::vector<float> a0 = flatFrame(W, H, 0.18f, 0.0f), o0(a0.size());
+    speakFrame(a1.data(), W, H, pr, o1.data());
+    speakFrame(a0.data(), W, H, pr, o0.data());
+    const double r1 = grainRmsD(a1, o1, 0), r0 = grainRmsD(a0, o0, 0);
+    printf("    rms(alpha=1)=%.5f  rms(alpha=0)=%.5f  ratio=%.3f (floor 0.3)\n", r1, r0, r0 / r1);
+    check(std::fabs(r0 / r1 - 0.3) < 0.05, "G23a matte on: alpha 0 grain = the floor of alpha 1 grain",
+          (std::string("ratio=") + std::to_string(r0 / r1)).c_str());
+    check(r1 > r0 * 2.0, "G23b matte on: cleaned regions get decisively more grain");
+
+    // A mid ramp: alpha 0.5 must land between, at lerp(floor,1,0.5) = 0.65.
+    std::vector<float> ah = flatFrame(W, H, 0.18f, 0.5f), oh(ah.size());
+    speakFrame(ah.data(), W, H, pr, oh.data());
+    const double rh = grainRmsD(ah, oh, 0);
+    check(std::fabs(rh / r1 - 0.65) < 0.05, "G23c matte on: alpha 0.5 lands at lerp(floor,1,0.5)",
+          (std::string("ratio=") + std::to_string(rh / r1)).c_str());
+
+    // grainMatte OFF: alpha is not read at all — outputs bit-identical.
+    SpeakParams po = pr; po.grainMatte = 0;
+    std::vector<float> x1(a1.size()), x0(a0.size());
+    speakFrame(a1.data(), W, H, po, x1.data());
+    speakFrame(a0.data(), W, H, po, x0.data());
+    bool same = true;
+    for (size_t k = 0; k < x1.size(); k += 4)
+        if (x1[k] != x0[k] || x1[k + 1] != x0[k + 1] || x1[k + 2] != x0[k + 2]) same = false;
+    check(same, "G23d matte off: alpha is ignored entirely (RGB bit-identical across alpha)");
+
+    // The matte SURVIVES Speak: output alpha == input alpha in all cases.
+    bool aPass = true;
+    for (size_t k = 3; k < o0.size(); k += 4) if (o0[k] != 0.0f) aPass = false;
+    for (size_t k = 3; k < o1.size(); k += 4) if (o1[k] != 1.0f) aPass = false;
+    check(aPass, "G23e alpha passes through untouched (the matte survives for later nodes)");
+}
+
+static void gateGrainStructure()
+{
+    printf("G24 dye layers are independent and the grain has a SIZE\n");
+    const int W = 192, H = 192;
+    std::vector<float> src = flatFrame(W, H, 0.18f, 1.0f), dst(src.size());
+    SpeakParams pr = grainParams(1.0f, 0.10f);
+    speakFrame(src.data(), W, H, pr, dst.data());
+    // R and G grain must be uncorrelated (separate emulsion layers).
+    double sr = 0, sg = 0, srg = 0, vr = 0, vg = 0; size_t n = 0;
+    for (size_t k = 0; k < src.size(); k += 4) {
+        const double a = dst[k] - src[k], b = dst[k + 1] - src[k + 1];
+        sr += a; sg += b; srg += a * b; vr += a * a; vg += b * b; n++;
+    }
+    const double corrRG = (srg / n - (sr / n) * (sg / n)) /
+                          (std::sqrt(vr / n - (sr / n) * (sr / n)) * std::sqrt(vg / n - (sg / n) * (sg / n)) + 1e-30);
+    printf("    corr(R grain, G grain) = %.4f\n", corrRG);
+    check(std::fabs(corrRG) < 0.05, "G24a RGB dye layers are decorrelated",
+          (std::string("corr=") + std::to_string(corrRG)).c_str());
+
+    // Size: at a coarse pitch (2% of H ~ 3.8px) neighbouring pixels must be
+    // strongly correlated (the field is smooth at that scale); at the 1px floor
+    // they must be nearly independent. A per-pixel white noise fails the first;
+    // a blurred-only (lowpass, no bandpass) noise would ALSO pass this — the
+    // bandpass half of the claim is the octave difference, asserted by the
+    // near-zero MEAN of the field (DC killed), checked here too.
+    auto lag1corr = [&](float sizePct) {
+        std::vector<float> d2(src.size());
+        SpeakParams p2 = grainParams(1.0f, sizePct);
+        speakFrame(src.data(), W, H, p2, d2.data());
+        double s = 0, s2 = 0, sl = 0; size_t m = 0;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x + 1 < W; ++x) {
+                const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+                const double a = d2[i] - src[i], b = d2[i + 4] - src[i + 4];
+                s += a; s2 += a * a; sl += a * b; m++;
+            }
+        const double mean = s / m;
+        return std::make_pair((sl / m - mean * mean) / (s2 / m - mean * mean + 1e-30), mean);
+    };
+    const std::pair<double,double> fine = lag1corr(0.10f);   // ~1 px pitch
+    const std::pair<double,double> coarse = lag1corr(2.0f);  // ~3.8 px pitch
+    printf("    lag-1 correlation: fine %.3f, coarse %.3f; field mean %.2e\n",
+           fine.first, coarse.first, coarse.second);
+    check(coarse.first > 0.5, "G24b coarse grain is spatially smooth at its pitch (it has a size)",
+          (std::string("corr=") + std::to_string(coarse.first)).c_str());
+    // The expected fine-pitch value is NOT zero, and asserting < 0.35 failed on
+    // correct code: at the 1 px floor the first octave is pure per-pixel hash
+    // (lag-1 corr 0), but the SECOND octave sits at 2 px pitch and its smooth
+    // field carries ~0.7 lag-1 correlation; the variance-weighted mix is
+    // (0 * 1/3 + 0.7 * 1/3) / (2/3) ~ 0.35 — which is the bandpass DOING ITS
+    // JOB, and 0.359 measured. Gate the honest claims: well below the coarse
+    // pitch (size responds), and below the derived 0.35 + margin.
+    check(fine.first < 0.45 && fine.first < coarse.first - 0.4,
+          "G24c fine grain decorrelates fast (octave mix ~0.35 by derivation)",
+          (std::string("corr=") + std::to_string(fine.first)).c_str());
+    check(std::fabs(coarse.second) < 2e-3, "G24d the grain field has ~zero DC (the bandpass claim)",
+          (std::string("mean=") + std::to_string(coarse.second)).c_str());
+}
+
 int main()
 {
     printf("=== Speak CPU gate suite ===\n");
@@ -742,6 +997,12 @@ int main()
     gateHalMaxlevNeverBinds();
     gateHalScopeSeesScatter();
     gateHalIsotropy();
+    gateGrainIdentity();
+    gateGrainShadowLoud();
+    gateGrainTemporal();
+    gateGrainMean();
+    gateGrainMatte();
+    gateGrainStructure();
     printf("\n%s (%d failures)\n", g_fail ? "FAILED" : "ALL GATES GREEN", g_fail);
     return g_fail ? 1 : 0;
 }

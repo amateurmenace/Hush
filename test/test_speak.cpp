@@ -23,6 +23,9 @@
 using namespace speakcore;
 
 static int g_fail = 0;
+// Gates that probe the pixel transform directly pass an empty stats block (the
+// scope is off in those cases, so it is never read).
+static uint32_t kNoStats[SPEAK_STATS_UINTS] = { 0 };
 static void check(bool ok, const char* name, const char* detail = "")
 {
     printf("  [%s] %s %s\n", ok ? "PASS" : "FAIL", name, detail);
@@ -190,7 +193,7 @@ static void gateScopeMatchesKernel()
             const float lin = k18Gray * std::exp2(inStops);
             const float enc = diEncode(lin);
             float oR, oG, oB;
-            processPixel(enc, enc, enc, 4, 4, 100, 100, pr, oR, oG, oB); // the REAL pixel path
+            processPixel(enc, enc, enc, 4, 4, 100, 100, pr, kNoStats,oR, oG, oB); // the REAL pixel path
             for (int ch = 0; ch < 3; ++ch) {
                 const float scopeOut = scopeYStops(inStops, ch, pr);
                 const float outCh = (ch == 0) ? oR : (ch == 1) ? oG : oB;
@@ -222,7 +225,7 @@ static void gateBakeCST()
         const float lin = std::pow(10.0f, -3.0f + 5.0f * (i / 400.0f));
         const float enc = diEncode(lin);
         float oR, oG, oB;
-        processPixel(enc, enc, enc, 4, 4, 100, 100, pr, oR, oG, oB);
+        processPixel(enc, enc, enc, 4, 4, 100, 100, pr, kNoStats,oR, oG, oB);
         maxChroma = std::fmax(maxChroma, std::fmax(std::fabs(oR - oG), std::fabs(oG - oB)));
     }
     check(maxChroma < 2e-3f, "DWG neutral bakes to Rec.709 neutral",
@@ -232,7 +235,7 @@ static void gateBakeCST()
     {
         const float enc = diEncode(k18Gray);
         float oR, oG, oB;
-        processPixel(enc, enc, enc, 4, 4, 100, 100, pr, oR, oG, oB);
+        processPixel(enc, enc, enc, 4, 4, 100, 100, pr, kNoStats,oR, oG, oB);
         const float expect = std::pow(k18Gray, 1.0f / 2.4f);
         check(std::fabs(oR - expect) < 3e-3f, "18% gray -> correct Rec.709 code",
               (std::string("got=") + std::to_string(oR) + " want=" + std::to_string(expect)).c_str());
@@ -280,22 +283,22 @@ static void gateViewDelivery()
     pr.viewMode = SPEAK_VIEW_INPUT;
     pr.profile = neutralProfile();
     float oR, oG, oB;
-    processPixel(encGray, encGray, encGray, 4, 4, 100, 100, pr, oR, oG, oB);
+    processPixel(encGray, encGray, encGray, 4, 4, 100, 100, pr, kNoStats,oR, oG, oB);
     check(std::fabs(oR - rec709Gray) < 3e-3f, "bake+Input shows input in Rec.709",
           (std::string("got=") + std::to_string(oR) + " want=" + std::to_string(rec709Gray)).c_str());
     check(std::fabs(oR - encGray) > 0.1f, "bake+Input is NOT the raw DI buffer");
 
     // Working + Input view: bit-exact raw input pass-through.
     pr.outputMode = SPEAK_OUT_WORKING;
-    processPixel(encGray, encGray, encGray, 4, 4, 100, 100, pr, oR, oG, oB);
+    processPixel(encGray, encGray, encGray, 4, 4, 100, 100, pr, kNoStats,oR, oG, oB);
     check(oR == encGray, "working+Input is bit-exact raw input");
 
     // Bake + Split: left half (input) and right half (result) share Rec.709 —
     // the left-half pixel equals the delivered input, the right-half is baked.
     pr.outputMode = SPEAK_OUT_BAKE_REC709; pr.viewMode = SPEAK_VIEW_SPLIT;
     float lR, lG, lB, rR, rG, rB;
-    processPixel(encGray, encGray, encGray, 10, 4, 100, 100, pr, lR, lG, lB);  // x<W/2 -> input
-    processPixel(encGray, encGray, encGray, 90, 4, 100, 100, pr, rR, rG, rB);  // x>=W/2 -> result
+    processPixel(encGray, encGray, encGray, 10, 4, 100, 100, pr, kNoStats,lR, lG, lB);  // x<W/2 -> input
+    processPixel(encGray, encGray, encGray, 90, 4, 100, 100, pr, kNoStats,rR, rG, rB);  // x>=W/2 -> result
     check(std::fabs(lR - rec709Gray) < 3e-3f, "bake+Split left half is delivered input (Rec.709)");
     check(std::fabs(rR - rec709Gray) < 6e-3f, "bake+Split right half is result (Rec.709, same space)");
 }

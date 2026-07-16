@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "ofxsImageEffect.h"
 #include "ofxsProcessing.h"
@@ -257,22 +258,31 @@ private:
         }
     }
 
-    // CPU reference path — respects the image rowBytes (fetchImage buffers may
-    // be padded). The GPU paths take Resolve's contiguous device buffers.
+    // CPU reference path — packs to a contiguous frame (fetchImage buffers may
+    // have padded rowBytes) and runs the SAME whole-frame entry point the tests
+    // and the GPU ports are verified against, so the scope's measurement pass
+    // is never duplicated. The GPU paths take Resolve's contiguous buffers.
     void renderCPU(OFX::Image* src, OFX::Image* dst, const SpeakParams& params)
     {
         const OfxRectI b = src->getBounds();
         const int W = b.x2 - b.x1, H = b.y2 - b.y1;
-        for (int y = 0; y < H; ++y) {
+        if (W <= 0 || H <= 0) return;
+        std::vector<float> in(static_cast<size_t>(W) * H * 4, 0.0f), out(static_cast<size_t>(W) * H * 4, 0.0f);
+        for (int y = 0; y < H; ++y)
             for (int x = 0; x < W; ++x) {
                 const float* s = static_cast<float*>(src->getPixelAddress(b.x1 + x, b.y1 + y));
-                float* d       = static_cast<float*>(dst->getPixelAddress(b.x1 + x, b.y1 + y));
-                if (!s || !d) continue;
-                float oR, oG, oB;
-                speakcore::processPixel(s[0], s[1], s[2], x, y, W, H, params, oR, oG, oB);
-                d[0] = oR; d[1] = oG; d[2] = oB; d[3] = s[3];
+                if (!s) continue;
+                float* d = &in[(static_cast<size_t>(y) * W + x) * 4];
+                d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3];
             }
-        }
+        speakcore::speakFrame(in.data(), W, H, params, out.data());
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                float* dp = static_cast<float*>(dst->getPixelAddress(b.x1 + x, b.y1 + y));
+                if (!dp) continue;
+                const float* o = &out[(static_cast<size_t>(y) * W + x) * 4];
+                dp[0] = o[0]; dp[1] = o[1]; dp[2] = o[2]; dp[3] = o[3];
+            }
     }
 
     OFX::Clip* m_DstClip;

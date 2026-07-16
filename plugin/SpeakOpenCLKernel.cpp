@@ -150,6 +150,21 @@ inline float toneChannel(float lin, int ch, const SpeakProfile* p)
     float Dref = chainDensity(0.0f, ch, p);
     return k18Gray * pow10f(-(Dprn - Dref));
 }
+#define SPEAK_EXP_BINS       128
+#define SPEAK_STATS_HIST_EXP 0
+#define SPEAK_STATS_HIST_MAX 128
+
+inline int expBinOf(float stops)
+{
+    int b = (int)((stops + 6.0f) / 12.0f * SPEAK_EXP_BINS);
+    return b < 0 ? 0 : (b >= SPEAK_EXP_BINS ? SPEAK_EXP_BINS - 1 : b);
+}
+inline float pixelStops(int cs, float r, float g, float b)
+{
+    float m = (decodeToLinear(cs, r) + decodeToLinear(cs, g) + decodeToLinear(cs, b)) * (1.0f / 3.0f);
+    return log2((m < kLinTiny ? kLinTiny : m) / k18Gray);
+}
+
 inline float density10(float lin)
 {
     return -log2(lin < 1e-6f ? 1e-6f : lin) * kLog10_2;
@@ -192,6 +207,7 @@ inline float scopeYStops(float inStops, int ch, const SpeakParams* pr)
 }
 
 inline bool hdScopePixel(int x, int y, int W, int H, const SpeakParams* pr,
+                         __global const uint* stats,
                          float* outR, float* outG, float* outB)
 {
     if (pr->scopeHD == 0) return false;
@@ -218,6 +234,14 @@ inline bool hdScopePixel(int x, int y, int W, int H, const SpeakParams* pr,
     int grow0 = (int)((6.0f - 0.0f) / 12.0f * (plotH - 1) + 0.5f);
     if (gx == gcol0 || gy == grow0) { *outR = 0.24f; *outG = 0.24f; *outB = 0.24f; return true; }
     if ((gx % (plotW / 6)) == 0 || (gy % (plotH / 6)) == 0) { *outR = 0.13f; *outG = 0.13f; *outB = 0.13f; }
+
+    uint hmax = stats[SPEAK_STATS_HIST_MAX];
+    if (hmax > 0u) {
+        int hb = expBinOf(-6.0f + 12.0f * ((float)gx / (plotW - 1)));
+        float f = (float)(stats[SPEAK_STATS_HIST_EXP + hb]) / (float)hmax;
+        int barH = (int)(sqrt(f) * (plotH * 0.45f) + 0.5f);
+        if (gy >= plotH - barH) { *outR = 0.16f; *outG = 0.19f; *outB = 0.24f; }
+    }
 
     int chR[3]; chR[0]=1; chR[1]=0; chR[2]=0;
     int chG[3]; chG[0]=0; chG[1]=1; chG[2]=0;
@@ -269,7 +293,8 @@ inline void deliverInput(const SpeakParams* pr, float r, float g, float b,
 }
 
 inline void processPixel(float r, float g, float b, int x, int y, int W, int H,
-                         const SpeakParams* pr, float* outR, float* outG, float* outB)
+                         const SpeakParams* pr, __global const uint* stats,
+                         float* outR, float* outG, float* outB)
 {
     int cs = pr->inputColorSpace;
     bool toneOn = (pr->enableTone != 0) && (pr->strength > 0.0f);
@@ -308,18 +333,39 @@ inline void processPixel(float r, float g, float b, int x, int y, int W, int H,
         deliverInput(pr, r, g, b, outR, outG, outB);
 
     float sr, sg, sb;
-    if (hdScopePixel(x, y, W, H, pr, &sr, &sg, &sb)) { *outR = sr; *outG = sg; *outB = sb; }
+    if (hdScopePixel(x, y, W, H, pr, stats, &sr, &sg, &sb)) { *outR = sr; *outG = sg; *outB = sb; }
+}
+
+// Scope measurement pass: bin the frame's exposure on a stride-2 grid. Integer
+// atomics are order-independent, so the counts are identical on every backend.
+__kernel void SpeakStatsKernel(SpeakParams p, int W, int H,
+                               __global const float* src, volatile __global uint* stats)
+{
+    int x = get_global_id(0) * 2, y = get_global_id(1) * 2;
+    if (x >= W || y >= H) return;
+    int i = (y * W + x) * 4;
+    int bin = expBinOf(pixelStops(p.inputColorSpace, src[i + 0], src[i + 1], src[i + 2]));
+    atomic_inc(&stats[SPEAK_STATS_HIST_EXP + bin]);
+}
+
+__kernel void SpeakStatsMaxKernel(__global uint* stats)
+{
+    uint mx = 0u;
+    for (int b = 0; b < SPEAK_EXP_BINS; ++b)
+        if (stats[SPEAK_STATS_HIST_EXP + b] > mx) mx = stats[SPEAK_STATS_HIST_EXP + b];
+    stats[SPEAK_STATS_HIST_MAX] = mx;
 }
 
 __kernel void SpeakKernel(SpeakParams p, int W, int H,
-                          __global const float* src, __global float* dst)
+                          __global const float* src, __global float* dst,
+                          __global const uint* stats)
 {
     int x = get_global_id(0);
     int y = get_global_id(1);
     if (x >= W || y >= H) return;
     int i = (y * W + x) * 4;
     float oR, oG, oB;
-    processPixel(src[i + 0], src[i + 1], src[i + 2], x, y, W, H, &p, &oR, &oG, &oB);
+    processPixel(src[i + 0], src[i + 1], src[i + 2], x, y, W, H, &p, stats, &oR, &oG, &oB);
     dst[i + 0] = oR; dst[i + 1] = oG; dst[i + 2] = oB; dst[i + 3] = src[i + 3];
 }
 )CLC";
@@ -349,7 +395,12 @@ public:
 #endif
 };
 
-struct SpeakRes { cl_kernel k = NULL; };
+struct SpeakRes {
+    cl_kernel k = NULL;         // main
+    cl_kernel kStats = NULL;    // scope measurement pass
+    cl_kernel kMax = NULL;      // bin-max finalize
+    cl_mem stats = NULL;
+};
 
 } // namespace
 
@@ -368,7 +419,7 @@ void RunOpenCLSpeak(void* p_CmdQ, int p_Width, int p_Height,
 
     SpeakParams params = p_Params;
 
-    cl_kernel kernel = NULL;
+    SpeakRes res;
     s_lock.Lock();
     {
         SpeakRes& r = s_res[p_CmdQ];
@@ -387,25 +438,58 @@ void RunOpenCLSpeak(void* p_CmdQ, int p_Width, int p_Height,
             }
             r.k = clCreateKernel(program, "SpeakKernel", &error);
             SpeakCheck(error, "create kernel");
+            r.kStats = clCreateKernel(program, "SpeakStatsKernel", &error);
+            SpeakCheck(error, "create stats kernel");
+            r.kMax = clCreateKernel(program, "SpeakStatsMaxKernel", &error);
+            SpeakCheck(error, "create stats-max kernel");
         }
-        kernel = r.k;
+        if (!r.stats)
+            r.stats = clCreateBuffer(clContext, CL_MEM_READ_WRITE,
+                                     SPEAK_STATS_UINTS * sizeof(cl_uint), NULL, &error);
+        res = r;
     }
     s_lock.Unlock();
 
     cl_mem src = reinterpret_cast<cl_mem>(const_cast<float*>(p_Src));
     cl_mem dst = reinterpret_cast<cl_mem>(p_Dst);
     int W = p_Width, H = p_Height;
+
+    // Zero the stats, then measure the frame only when a scope is showing it.
+    const cl_uint zero = 0;
+    clEnqueueFillBuffer(cmdQ, res.stats, &zero, sizeof(cl_uint), 0,
+                        SPEAK_STATS_UINTS * sizeof(cl_uint), 0, NULL, NULL);
+    if (params.scopeHD != 0) {
+        int c = 0;
+        error  = clSetKernelArg(res.kStats, c++, sizeof(SpeakParams), &params);
+        error |= clSetKernelArg(res.kStats, c++, sizeof(int), &W);
+        error |= clSetKernelArg(res.kStats, c++, sizeof(int), &H);
+        error |= clSetKernelArg(res.kStats, c++, sizeof(cl_mem), &src);
+        error |= clSetKernelArg(res.kStats, c++, sizeof(cl_mem), &res.stats);
+        SpeakCheck(error, "set stats args");
+        const size_t localH[2]  = { 16, 16 };
+        const size_t globalH[2] = { static_cast<size_t>((p_Width / 2 + 15) / 16) * 16,
+                                    static_cast<size_t>((p_Height / 2 + 15) / 16) * 16 };
+        error = clEnqueueNDRangeKernel(cmdQ, res.kStats, 2, NULL, globalH, localH, 0, NULL, NULL);
+        SpeakCheck(error, "enqueue stats");
+
+        error = clSetKernelArg(res.kMax, 0, sizeof(cl_mem), &res.stats);
+        const size_t one[2] = { 1, 1 };
+        error |= clEnqueueNDRangeKernel(cmdQ, res.kMax, 2, NULL, one, NULL, 0, NULL, NULL);
+        SpeakCheck(error, "enqueue stats-max");
+    }
+
     int c = 0;
-    error  = clSetKernelArg(kernel, c++, sizeof(SpeakParams), &params);
-    error |= clSetKernelArg(kernel, c++, sizeof(int), &W);
-    error |= clSetKernelArg(kernel, c++, sizeof(int), &H);
-    error |= clSetKernelArg(kernel, c++, sizeof(cl_mem), &src);
-    error |= clSetKernelArg(kernel, c++, sizeof(cl_mem), &dst);
+    error  = clSetKernelArg(res.k, c++, sizeof(SpeakParams), &params);
+    error |= clSetKernelArg(res.k, c++, sizeof(int), &W);
+    error |= clSetKernelArg(res.k, c++, sizeof(int), &H);
+    error |= clSetKernelArg(res.k, c++, sizeof(cl_mem), &src);
+    error |= clSetKernelArg(res.k, c++, sizeof(cl_mem), &dst);
+    error |= clSetKernelArg(res.k, c++, sizeof(cl_mem), &res.stats);
     SpeakCheck(error, "set args");
 
     const size_t local[2]  = { 16, 16 };
     const size_t global[2] = { static_cast<size_t>((p_Width + 15) / 16) * 16,
                                static_cast<size_t>((p_Height + 15) / 16) * 16 };
-    error = clEnqueueNDRangeKernel(cmdQ, kernel, 2, NULL, global, local, 0, NULL, NULL);
+    error = clEnqueueNDRangeKernel(cmdQ, res.k, 2, NULL, global, local, 0, NULL, NULL);
     SpeakCheck(error, "enqueue");
 }

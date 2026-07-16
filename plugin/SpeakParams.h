@@ -129,4 +129,21 @@ typedef struct SpeakParams
     SpeakProfile profile;
 } SpeakParams;
 
+// ---------------------------------------------------------------------------
+// Scope statistics buffer (uint32 slots). The scopes are measured FROM the
+// frame by the same kernels that filter it, exactly like Hush's — so the panel
+// can never disagree with the pixels. Populated only when a scope is on.
+//
+// The frame is sampled on a stride-2 grid (identically on CPU and GPU) and
+// binned with integer atomics, which are order-independent — so every backend
+// lands on bit-identical counts and the parity test stays meaningful.
+//
+// This table is re-declared inside the Metal and OpenCL kernel sources (CUDA
+// includes this header). Bump carefully.
+// ---------------------------------------------------------------------------
+#define SPEAK_EXP_BINS       128  // scene log2-exposure bins over [-6,+6] stops
+#define SPEAK_STATS_HIST_EXP 0    // 128 bins: the frame's exposure distribution
+#define SPEAK_STATS_HIST_MAX 128  // the largest bin count (bar normalisation)
+#define SPEAK_STATS_UINTS    129
+
 #endif // OPENNR_SPEAKPARAMS_H

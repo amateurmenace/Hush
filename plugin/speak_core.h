@@ -298,6 +298,39 @@ static inline void setDyeCoupler(SpeakProfile& p, float amount)
 // with an 18% gray crosshair and R/G/B legend swatches. Text labels and the
 // live exposure histogram land in the next increment.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Scope statistics — the frame's own exposure distribution, measured on a
+// stride-2 grid and binned with integer counts (order-independent, so all four
+// backends land on identical bins).
+// ---------------------------------------------------------------------------
+static inline int expBinOf(float stops)
+{
+    const int b = static_cast<int>((stops + 6.0f) / 12.0f * SPEAK_EXP_BINS);
+    return b < 0 ? 0 : (b >= SPEAK_EXP_BINS ? SPEAK_EXP_BINS - 1 : b);
+}
+// A pixel's scene exposure in stops (mean of the linear channels — color-space
+// agnostic, so the histogram means the same thing in any declared input space).
+static inline float pixelStops(int cs, float r, float g, float b)
+{
+    const float m = (decodeToLinear(cs, r) + decodeToLinear(cs, g) + decodeToLinear(cs, b)) * (1.0f / 3.0f);
+    return std::log2((m < kLinTiny ? kLinTiny : m) / k18Gray);
+}
+inline void computeStats(const float* src, int W, int H, const SpeakParams& pr, uint32_t* stats)
+{
+    for (int i = 0; i < SPEAK_STATS_UINTS; ++i) stats[i] = 0u;
+    if (pr.scopeHD == 0) return;                       // only measured when shown
+    const int cs = pr.inputColorSpace;
+    for (int y = 0; y < H; y += 2)
+        for (int x = 0; x < W; x += 2) {
+            const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+            stats[SPEAK_STATS_HIST_EXP + expBinOf(pixelStops(cs, src[i], src[i + 1], src[i + 2]))]++;
+        }
+    uint32_t mx = 0u;
+    for (int b = 0; b < SPEAK_EXP_BINS; ++b)
+        if (stats[SPEAK_STATS_HIST_EXP + b] > mx) mx = stats[SPEAK_STATS_HIST_EXP + b];
+    stats[SPEAK_STATS_HIST_MAX] = mx;
+}
+
 // The APPLIED transform for one input exposure, in stops. It mirrors the pixel
 // path EXACTLY — including the Strength mix and the enable toggle — so the plot
 // can never disagree with the pixels (at strength 0 it collapses to the y=x
@@ -317,6 +350,7 @@ static inline float scopeYStops(float inStops, int ch, const SpeakParams& pr)
 // Returns true and writes an (r,g,b) display-space color if (x,y) is a scope
 // pixel. `out*` are only touched when it returns true.
 static inline bool hdScopePixel(int x, int y, int W, int H, const SpeakParams& pr,
+                                const uint32_t* stats,
                                 float& outR, float& outG, float& outB)
 {
     if (pr.scopeHD == 0) return false;
@@ -349,6 +383,16 @@ static inline bool hdScopePixel(int x, int y, int W, int H, const SpeakParams& p
     const int grow0 = static_cast<int>((6.0f - 0.0f) / 12.0f * (plotH - 1) + 0.5f);
     if (gx == gcol0 || gy == grow0) { outR = outG = outB = 0.24f; return true; }
     if ((gx % (plotW / 6)) == 0 || (gy % (plotH / 6)) == 0) { outR = outG = outB = 0.13f; }
+
+    // The frame's own exposure histogram, projected onto the logE axis under
+    // the curves — so you can see where THIS shot's tones sit on the curve.
+    const uint32_t hmax = stats[SPEAK_STATS_HIST_MAX];
+    if (hmax > 0u) {
+        const int hb = expBinOf(-6.0f + 12.0f * (static_cast<float>(gx) / (plotW - 1)));
+        const float f = static_cast<float>(stats[SPEAK_STATS_HIST_EXP + hb]) / static_cast<float>(hmax);
+        const int barH = static_cast<int>(std::sqrt(f) * (plotH * 0.45f) + 0.5f);
+        if (gy >= plotH - barH) { outR = 0.16f; outG = 0.19f; outB = 0.24f; }
+    }
 
     // The three applied per-channel curves. A column is "on" a curve when the
     // row's output-stops straddles the curve value between this and the next
@@ -413,7 +457,7 @@ static inline void deliverInput(const SpeakParams& pr, float r, float g, float b
 // ---------------------------------------------------------------------------
 static inline void processPixel(float r, float g, float b,
                                 int x, int y, int W, int H,
-                                const SpeakParams& pr,
+                                const SpeakParams& pr, const uint32_t* stats,
                                 float& outR, float& outG, float& outB)
 {
     const SpeakProfile& p = pr.profile;
@@ -470,7 +514,7 @@ static inline void processPixel(float r, float g, float b,
 
     // Scopes render last, over any view.
     float sr, sg, sb;
-    if (hdScopePixel(x, y, W, H, pr, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
+    if (hdScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
 }
 
 // ---------------------------------------------------------------------------
@@ -479,11 +523,13 @@ static inline void processPixel(float r, float g, float b,
 // ---------------------------------------------------------------------------
 inline void speakFrame(const float* src, int W, int H, const SpeakParams& pr, float* dst)
 {
+    uint32_t stats[SPEAK_STATS_UINTS];
+    computeStats(src, W, H, pr, stats);           // measure the frame, then render
     for (int y = 0; y < H; ++y) {
         for (int x = 0; x < W; ++x) {
             const size_t i = (static_cast<size_t>(y) * W + x) * 4;
             float oR, oG, oB;
-            processPixel(src[i + 0], src[i + 1], src[i + 2], x, y, W, H, pr, oR, oG, oB);
+            processPixel(src[i + 0], src[i + 1], src[i + 2], x, y, W, H, pr, stats, oR, oG, oB);
             dst[i + 0] = oR;
             dst[i + 1] = oG;
             dst[i + 2] = oB;

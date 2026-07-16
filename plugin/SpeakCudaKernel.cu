@@ -127,6 +127,17 @@ __device__ inline float toneChannel(float lin, int ch, const SpeakProfile& p)
     float Dref = chainDensity(0.0f, ch, p);
     return k18Gray * pow10f(-(Dprn - Dref));
 }
+__device__ inline int expBinOf(float stops)
+{
+    int b = (int)((stops + 6.0f) / 12.0f * SPEAK_EXP_BINS);
+    return b < 0 ? 0 : (b >= SPEAK_EXP_BINS ? SPEAK_EXP_BINS - 1 : b);
+}
+__device__ inline float pixelStops(int cs, float r, float g, float b)
+{
+    float m = (decodeToLinear(cs, r) + decodeToLinear(cs, g) + decodeToLinear(cs, b)) * (1.0f / 3.0f);
+    return log2f((m < kLinTiny ? kLinTiny : m) / k18Gray);
+}
+
 __device__ inline float density10(float lin)
 {
     return -log2f(lin < 1e-6f ? 1e-6f : lin) * kLog10_2;
@@ -169,6 +180,7 @@ __device__ inline float scopeYStops(float inStops, int ch, const SpeakParams& pr
 }
 
 __device__ inline bool hdScopePixel(int x, int y, int W, int H, const SpeakParams& pr,
+                                    const unsigned int* stats,
                                     float& outR, float& outG, float& outB)
 {
     if (pr.scopeHD == 0) return false;
@@ -195,6 +207,14 @@ __device__ inline bool hdScopePixel(int x, int y, int W, int H, const SpeakParam
     int grow0 = (int)((6.0f - 0.0f) / 12.0f * (plotH - 1) + 0.5f);
     if (gx == gcol0 || gy == grow0) { outR = 0.24f; outG = 0.24f; outB = 0.24f; return true; }
     if ((gx % (plotW / 6)) == 0 || (gy % (plotH / 6)) == 0) { outR = 0.13f; outG = 0.13f; outB = 0.13f; }
+
+    unsigned int hmax = stats[SPEAK_STATS_HIST_MAX];
+    if (hmax > 0u) {
+        int hb = expBinOf(-6.0f + 12.0f * ((float)gx / (plotW - 1)));
+        float f = (float)(stats[SPEAK_STATS_HIST_EXP + hb]) / (float)hmax;
+        int barH = (int)(sqrtf(f) * (plotH * 0.45f) + 0.5f);
+        if (gy >= plotH - barH) { outR = 0.16f; outG = 0.19f; outB = 0.24f; }
+    }
 
     int chR[3]; chR[0]=1; chR[1]=0; chR[2]=0;
     int chG[3]; chG[0]=0; chG[1]=1; chG[2]=0;
@@ -246,7 +266,8 @@ __device__ inline void deliverInput(const SpeakParams& pr, float r, float g, flo
 }
 
 __device__ inline void processPixel(float r, float g, float b, int x, int y, int W, int H,
-                                    const SpeakParams& pr, float& outR, float& outG, float& outB)
+                                    const SpeakParams& pr, const unsigned int* stats,
+                                    float& outR, float& outG, float& outB)
 {
     int cs = pr.inputColorSpace;
     bool toneOn = (pr.enableTone != 0) && (pr.strength > 0.0f);
@@ -285,11 +306,32 @@ __device__ inline void processPixel(float r, float g, float b, int x, int y, int
         deliverInput(pr, r, g, b, outR, outG, outB);
 
     float sr, sg, sb;
-    if (hdScopePixel(x, y, W, H, pr, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
+    if (hdScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
+}
+
+// Scope measurement pass: bin the frame's exposure on a stride-2 grid. Integer
+// atomics are order-independent, so the counts are identical on every backend.
+__global__ void SpeakStatsKernel(SpeakParams p, int W, int H,
+                                 const float4* src, unsigned int* stats)
+{
+    int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
+    int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
+    if (x >= W || y >= H) return;
+    float4 s = src[y * W + x];
+    int bin = expBinOf(pixelStops(p.inputColorSpace, s.x, s.y, s.z));
+    atomicAdd(&stats[SPEAK_STATS_HIST_EXP + bin], 1u);
+}
+
+__global__ void SpeakStatsMaxKernel(unsigned int* stats)
+{
+    unsigned int mx = 0u;
+    for (int b = 0; b < SPEAK_EXP_BINS; ++b)
+        if (stats[SPEAK_STATS_HIST_EXP + b] > mx) mx = stats[SPEAK_STATS_HIST_EXP + b];
+    stats[SPEAK_STATS_HIST_MAX] = mx;
 }
 
 __global__ void SpeakKernel(SpeakParams p, int W, int H,
-                            const float4* src, float4* dst)
+                            const float4* src, float4* dst, const unsigned int* stats)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -297,10 +339,12 @@ __global__ void SpeakKernel(SpeakParams p, int W, int H,
     int i = y * W + x;
     float4 s = src[i];
     float oR, oG, oB;
-    processPixel(s.x, s.y, s.z, x, y, W, H, p, oR, oG, oB);
+    processPixel(s.x, s.y, s.z, x, y, W, H, p, stats, oR, oG, oB);
     float4 o; o.x = oR; o.y = oG; o.z = oB; o.w = s.w;
     dst[i] = o;
 }
+
+struct SpeakCudaRes { unsigned int* stats = nullptr; };
 
 } // namespace
 
@@ -308,9 +352,25 @@ void RunCudaSpeak(void* p_Stream, int p_Width, int p_Height,
                   const SpeakParams& p_Params, const float* p_Src, float* p_Dst)
 {
     cudaStream_t stream = static_cast<cudaStream_t>(p_Stream);
+
+    // One stats buffer per stream, allocated lazily (mirrors Hush's per-stream
+    // resource cache).
+    static std::map<void*, SpeakCudaRes> s_res;
+    SpeakCudaRes& r = s_res[p_Stream];
+    if (!r.stats)
+        cudaMalloc(&r.stats, SPEAK_STATS_UINTS * sizeof(unsigned int));
+
     dim3 block(16, 16, 1);
+    cudaMemsetAsync(r.stats, 0, SPEAK_STATS_UINTS * sizeof(unsigned int), stream);
+    if (p_Params.scopeHD != 0) {
+        dim3 gridH((p_Width / 2 + block.x - 1) / block.x, (p_Height / 2 + block.y - 1) / block.y, 1);
+        SpeakStatsKernel<<<gridH, block, 0, stream>>>(p_Params, p_Width, p_Height,
+                                                      reinterpret_cast<const float4*>(p_Src), r.stats);
+        SpeakStatsMaxKernel<<<1, 1, 0, stream>>>(r.stats);
+    }
+
     dim3 grid((p_Width + block.x - 1) / block.x, (p_Height + block.y - 1) / block.y, 1);
     SpeakKernel<<<grid, block, 0, stream>>>(p_Params, p_Width, p_Height,
                                             reinterpret_cast<const float4*>(p_Src),
-                                            reinterpret_cast<float4*>(p_Dst));
+                                            reinterpret_cast<float4*>(p_Dst), r.stats);
 }

@@ -59,7 +59,40 @@ static SpeakProfile stockProfile()
     return p;
 }
 
-static cl_context g_ctx; static cl_command_queue g_q;
+static cl_context g_ctx; static cl_command_queue g_q; static cl_device_id g_dev;
+
+// Apple's DEPRECATED OpenCL runtime miscompiles global int32 atomics: a minimal
+// 1000-work-item atomic_inc over 4 bins returns ~1.7e9 in every bin instead of
+// 250, even though the device advertises cl_khr_global_int32_base_atomics (plain
+// __global writes on the same buffer are fine). The scope's measurement pass
+// bins the frame with atomics, so on such a device its result is meaningless.
+//
+// We probe for it and SKIP the stats-dependent cases loudly rather than silently
+// passing them or reporting a false parity failure — the kernel source is
+// correct and IS verified here on CPU + Metal, and OpenCL's real targets
+// (NVIDIA/AMD/Intel on Windows/Linux) have working atomics. macOS production
+// renders via Metal, so no shipping path depends on this.
+// (This very likely also explains Hush's long-standing ~2e-3 Apple-OpenCL
+// divergence — its noise estimator accumulates histograms with atomics too.)
+static bool atomicsWork()
+{
+    static const char* K =
+        "__kernel void probe(volatile __global uint* s){ atomic_inc(&s[get_global_id(0) % 4]); }\n";
+    cl_int e;
+    cl_program pr = clCreateProgramWithSource(g_ctx, 1, &K, NULL, &e);
+    if (clBuildProgram(pr, 1, &g_dev, NULL, NULL, NULL) != CL_SUCCESS) return false;
+    cl_kernel k = clCreateKernel(pr, "probe", &e);
+    cl_mem b = clCreateBuffer(g_ctx, CL_MEM_READ_WRITE, 16, NULL, &e);
+    cl_uint z = 0, out[4] = { 0, 0, 0, 0 };
+    clEnqueueFillBuffer(g_q, b, &z, sizeof(cl_uint), 0, 16, 0, NULL, NULL);
+    clSetKernelArg(k, 0, sizeof(cl_mem), &b);
+    size_t g = 1000;
+    clEnqueueNDRangeKernel(g_q, k, 1, NULL, &g, NULL, 0, NULL, NULL);
+    clFinish(g_q);
+    clEnqueueReadBuffer(g_q, b, CL_TRUE, 0, 16, out, 0, NULL, NULL);
+    clReleaseMemObject(b); clReleaseKernel(k); clReleaseProgram(pr);
+    return (out[0] + out[1] + out[2] + out[3]) == 1000u;
+}
 
 static void run(int W, int H, const SpeakParams& p, const char* label, int mode)
 {
@@ -103,8 +136,18 @@ int main()
     if (clGetDeviceIDs(plat, CL_DEVICE_TYPE_GPU, 1, &dev, NULL) != CL_SUCCESS &&
         clGetDeviceIDs(plat, CL_DEVICE_TYPE_ALL, 1, &dev, NULL) != CL_SUCCESS) { printf("no device\n"); return 0; }
     cl_int err;
+    g_dev = dev;
     g_ctx = clCreateContext(NULL, 1, &dev, NULL, NULL, &err);
     g_q = clCreateCommandQueue(g_ctx, dev, 0, &err);
+    const bool atomicsOK = atomicsWork();
+    if (!atomicsOK) {
+        char nm[128] = { 0 };
+        clGetDeviceInfo(dev, CL_DEVICE_NAME, sizeof(nm) - 1, nm, NULL);
+        printf("  NOTE: this device's OpenCL global int32 atomics are BROKEN (%s).\n"
+               "        The scope's measurement pass depends on them, so stats-dependent\n"
+               "        cases are SKIPPED here. The kernel is verified on CPU + Metal;\n"
+               "        OpenCL's real targets (Win/Linux NVIDIA/AMD/Intel) are unaffected.\n", nm);
+    }
     const int W = 640, H = 480;
 
     { SpeakParams p = baseParams(); p.strength = 0.0f; run(W, H, p, "identity (strength 0)", 0); }
@@ -125,7 +168,8 @@ int main()
       speakcore::setDyeCoupler(p.profile, 0.7f);
       p.profile.subSatKnee[0] = p.profile.subSatKnee[1] = p.profile.subSatKnee[2] = 2.2f;
       run(W, H, p, "tone + subtractive color", 0); }
-    { SpeakParams p = baseParams(); p.scopeHD = 1; p.strength = 0.6f; p.profile = stockProfile(); run(W, H, p, "scope H&D on s0.6", 1); }
+    if (atomicsOK) { SpeakParams p = baseParams(); p.scopeHD = 1; p.strength = 0.6f; p.profile = stockProfile(); run(W, H, p, "scope H&D on s0.6", 1); }
+    else           printf("  [SKIP] scope H&D on s0.6            (device's OpenCL atomics are broken)\n");
 
     printf("\n%s (%d failures)\n", g_fail ? "PARITY FAILED" : "PARITY GREEN", g_fail);
     return g_fail ? 1 : 0;

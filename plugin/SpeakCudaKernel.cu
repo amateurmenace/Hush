@@ -306,35 +306,84 @@ __device__ inline void halDecimatePixel(const float* arena, int sOff, int sW, in
     }
 }
 
+// Cubic B-spline read of one level onto a (W,H) grid — B-spline, NOT bilinear
+// and NOT Catmull-Rom. See the core: bilinear is only C0 and its derivative
+// discontinuity at every texel boundary is what made the skirt read as hard
+// rectangular BLOCKS; Catmull-Rom's overshoot would push a scatter field below
+// zero. The B-spline weights are C2, non-negative and sum to 1.
+__device__ inline void halBSpline(float t, float* w)
+{
+    float t2 = t * t, t3 = t2 * t;
+    w[0] = (1.0f - 3.0f * t + 3.0f * t2 - t3) * (1.0f / 6.0f);
+    w[1] = (4.0f - 6.0f * t2 + 3.0f * t3) * (1.0f / 6.0f);
+    w[2] = (1.0f + 3.0f * t + 3.0f * t2 - 3.0f * t3) * (1.0f / 6.0f);
+    w[3] = t3 * (1.0f / 6.0f);
+}
 __device__ inline float halSampleLevel(const float* arena, int off, int lw, int lh,
                                        int W, int H, int x, int y, int c)
 {
     float fx = ((float)x + 0.5f) * (float)lw / (float)W - 0.5f;
     float fy = ((float)y + 0.5f) * (float)lh / (float)H - 0.5f;
     int x0 = (int)floorf(fx), y0 = (int)floorf(fy);   // floorf: fx/fy go negative at the edge
-    float tx = fx - (float)x0, ty = fy - (float)y0;
-    float a = lerpf(halFetch(arena, off, lw, lh, x0,     y0,     c),
-                    halFetch(arena, off, lw, lh, x0 + 1, y0,     c), tx);
-    float b = lerpf(halFetch(arena, off, lw, lh, x0,     y0 + 1, c),
-                    halFetch(arena, off, lw, lh, x0 + 1, y0 + 1, c), tx);
-    return lerpf(a, b, ty);
+    float wx[4], wy[4];
+    halBSpline(fx - (float)x0, wx);
+    halBSpline(fy - (float)y0, wy);
+    float acc = 0.0f;
+    for (int j = 0; j < 4; ++j) {
+        float row = 0.0f;
+        for (int i = 0; i < 4; ++i)
+            row += wx[i] * halFetch(arena, off, lw, lh, x0 - 1 + i, y0 - 1 + j, c);
+        acc += wy[j] * row;
+    }
+    return acc;
 }
 
-__device__ inline void halScatterAt(const float* arena, int W, int H, int nLev,
-                                    float sigmaTarget, int x, int y, float* out)
+// The mixture's total weight — the normalizer that makes the pyramid
+// energy-preserving. Same loop, same halLevelWeight, on every backend.
+__device__ inline float halWeightSum(int nLev, float sigmaTarget)
 {
-    float acc[3]; acc[0] = 0.0f; acc[1] = 0.0f; acc[2] = 0.0f;
     float wsum = 0.0f;
-    for (int L = 0; L < nLev; ++L) {
-        float wl = halLevelWeight(L, sigmaTarget);
-        int lw, lh, off;
-        halLevelInfo(W, H, L, lw, lh, off);
-        for (int c = 0; c < 3; ++c)
-            acc[c] += wl * halSampleLevel(arena, off, lw, lh, W, H, x, y, c);
-        wsum += wl;
+    for (int L = 0; L < nLev; ++L) wsum += halLevelWeight(L, sigmaTarget);
+    return wsum;
+}
+
+// COARSE-TO-FINE ACCUMULATE — one pixel of level L (replaces halScatterAt,
+// which read EVERY level directly at full res with a bilinear tap):
+//     acc_L = w_L * level_L + upsample_2x(acc_{L+1})
+// running L = nLev-1 down to 0, in place in the arena. acc_0 is then the whole
+// (unnormalized) mixture at full resolution.
+//
+// Note the dst dims handed to halSampleLevel are (lw, lh) — LEVEL L's grid, NOT
+// (W, H): the coarser level is upsampled ONE OCTAVE onto level L, so each step
+// interpolates only between ADJACENT samples and is then re-filtered by every
+// step below it. Measured: worst-case angular variation 3.72 -> 0.13. It is also
+// strictly CHEAPER — sum_L (level L's pixels) = 4/3 N, against nLev*N.
+//
+// IN-PLACE SAFETY: a thread reads its OWN (x,y) at level L plus a neighbourhood
+// at level L+1 — a DISJOINT arena region, finished by the previous dispatch —
+// and writes only its own (x,y) at level L. No thread reads another thread's
+// level-L pixel, so in place is safe and no atomics are involved.
+//
+// The level geometry (both levels' dims + offsets, L and nLev) is passed IN from
+// the host rather than recomputed from L in-kernel — same as SpeakMetalKernel and
+// SpeakOpenCLKernel, and for the reason recorded there: the accumulate holds the
+// arena WRITABLE, and the back-to-back halLevelInfo calls were observed to
+// misbehave under that. The host computes them with the SAME halLevelInfo, which
+// is deterministic integer arithmetic, so the values agree with the core's by
+// construction and parity is untouched. `sigmaTarget` stays in-kernel so it
+// cannot drift from the normalize pass.
+__device__ inline void halAccumPixel(float* arena, int L, int nLev, float sigmaTarget,
+                                     int lw, int lh, int off, int cw, int ch, int coff,
+                                     int x, int y, float* out)
+{
+    float wl = halLevelWeight(L, sigmaTarget);
+    if (L >= nLev - 1) {                       // the coarsest level: nothing above it
+        for (int c = 0; c < 3; ++c) out[c] = wl * halFetch(arena, off, lw, lh, x, y, c);
+        return;
     }
-    float inv = wsum > 0.0f ? (1.0f / wsum) : 0.0f;
-    for (int c = 0; c < 3; ++c) out[c] = acc[c] * inv;
+    for (int c = 0; c < 3; ++c)
+        out[c] = wl * halFetch(arena, off, lw, lh, x, y, c)
+               + halSampleLevel(arena, coff, cw, ch, lw, lh, x, y, c);
 }
 
 // `scat*` are the energy-normalized, blurred, PER-CHANNEL scene-linear highlight
@@ -586,12 +635,14 @@ __device__ inline void processPixel(float r, float g, float b,
 
 // ---------------------------------------------------------------------------
 // The scatter pyramid — a textual port of speak_core.h's buildHalScatter, split
-// across three dispatches because a GPU cannot carry the level barriers inside
-// one kernel. All three run on the SAME stream as the stats/main kernels, and
-// STREAM ORDER IS THE BARRIER: each launch completes before the next begins, so
-// the level-L decimation always reads a finished level L-1 and the stats pass
-// always reads a finished scatter plane. No explicit sync, and no atomics
-// anywhere in this chain (box decimation is order-independent).
+// across FOUR kernels (excess -> decimate -> accum -> normalize) because a GPU
+// cannot carry the level barriers inside one kernel: decimate and accum are each
+// dispatched ONCE PER LEVEL. They all run on the SAME stream as the stats/main
+// kernels, and STREAM ORDER IS THE BARRIER: each launch completes before the next
+// begins, so the level-L decimation always reads a finished level L-1, the
+// level-L accumulate always reads a finished level L+1, and the stats pass always
+// reads a finished scatter plane. No explicit sync, and no atomics anywhere in
+// this chain (decimation and accumulation are both order-independent).
 // ---------------------------------------------------------------------------
 
 // Level 0 of the arena: the per-channel scene-linear highlight excess.
@@ -627,18 +678,48 @@ __global__ void SpeakDecimateKernel(int W, int H, int L, float* arena)
     arena[o + 0] = v[0]; arena[o + 1] = v[1]; arena[o + 2] = v[2];
 }
 
-// Full res: the energy-normalized octave mixture at every pixel.
-__global__ void SpeakScatterKernel(SpeakParams p, int W, int H, int nLev,
-                                   const float* arena, float* scat)
+// One dispatch PER LEVEL L = nLev-1 down to 0: the coarse-to-fine accumulate,
+// IN PLACE in the arena, with the grid = LEVEL L's dims. All the level geometry
+// comes from the host's halLevelInfo — see halAccumPixel.
+//
+// In-place is safe: see halAccumPixel. Each thread reads its own (x,y) at level
+// L plus a neighbourhood at level L+1 (a disjoint arena region) and writes only
+// its own (x,y) at level L.
+//
+// The ORDER is load-bearing — level L reads level L+1 as rewritten by the
+// PREVIOUS dispatch — and stream ordering supplies that barrier for free: each
+// launch on the stream completes before the next begins, so no explicit
+// inter-level sync is needed.
+__global__ void SpeakAccumKernel(SpeakParams p, int H, int L, int nLev,
+                                 int lw, int lh, int off, int cw, int ch, int coff,
+                                 float* arena)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= lw || y >= lh) return;
+    float sig = halSigmaPx(H, p);
+    float v[3];
+    halAccumPixel(arena, L, nLev, sig, lw, lh, off, cw, ch, coff, x, y, v);
+    size_t o = ((size_t)off + (size_t)y * lw + x) * 3;
+    arena[o + 0] = v[0]; arena[o + 1] = v[1]; arena[o + 2] = v[2];
+}
+
+// Full res: normalize level 0 of the accumulated arena into the scatter plane.
+// sum(w) = 1 => energy preserved. halWeightSum runs in-kernel against the same
+// __device__ halLevelWeight the accumulate used, so there is no host/device math
+// path that could drift from the reference.
+__global__ void SpeakNormalizeKernel(SpeakParams p, int W, int H, int nLev,
+                                     const float* arena, float* scat)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= W || y >= H) return;
     float sig = halSigmaPx(H, p);
-    float v[3];
-    halScatterAt(arena, W, H, nLev, sig, x, y, v);
-    size_t o = ((size_t)y * W + x) * 3;
-    scat[o + 0] = v[0]; scat[o + 1] = v[1]; scat[o + 2] = v[2];
+    float inv = 1.0f / halWeightSum(nLev, sig);
+    size_t o = ((size_t)y * W + x) * 3;   // level 0's arena offset is 0
+    scat[o + 0] = arena[o + 0] * inv;
+    scat[o + 1] = arena[o + 1] * inv;
+    scat[o + 2] = arena[o + 2] * inv;
 }
 
 // Scope measurement pass: bin the frame on a stride-2 grid. Integer atomics are
@@ -783,9 +864,14 @@ void RunCudaSpeak(void* p_Stream, int p_Width, int p_Height,
     dim3 block(16, 16, 1);
     dim3 grid((p_Width + block.x - 1) / block.x, (p_Height + block.y - 1) / block.y, 1);
 
-    // Dispatch order: excess -> decimate(L=1..nLev-1) -> scatter -> stats -> main.
-    // The scatter must exist BEFORE stats, because the density parade measures
-    // the halated result. Stream ordering supplies every barrier.
+    // Dispatch order, mirroring buildHalScatter's three stages:
+    //   excess -> decimate(L=1..nLev-1) -> accum(L=nLev-1..0) -> normalize
+    //          -> stats -> main.
+    // The accumulate runs COARSE TO FINE, one dispatch per level, each reading
+    // the level above it as rewritten by the previous dispatch. Those inter-level
+    // barriers are FREE: everything here is on one stream, and stream order means
+    // each launch completes before the next begins. The scatter must exist BEFORE
+    // stats, because the density parade measures the halated result.
     if (hal) {
         SpeakExcessKernel<<<grid, block, 0, stream>>>(p_Params, p_Width, p_Height,
                                                       reinterpret_cast<const float4*>(p_Src),
@@ -796,8 +882,21 @@ void RunCudaSpeak(void* p_Stream, int p_Width, int p_Height,
             dim3 gridL((lw + block.x - 1) / block.x, (lh + block.y - 1) / block.y, 1);
             SpeakDecimateKernel<<<gridL, block, 0, stream>>>(p_Width, p_Height, L, res.arena);
         }
-        SpeakScatterKernel<<<grid, block, 0, stream>>>(p_Params, p_Width, p_Height, nLev,
-                                                       res.arena, res.scat);
+        // The level geometry is computed HOST-side by the same halLevelInfo the
+        // kernels use and passed in — the accumulate holds the arena writable,
+        // and this is the pattern that has worked for that (see halAccumPixel).
+        // Level L+1's geometry is computed unconditionally; at L = nLev-1 the
+        // kernel takes the coarsest-level branch and simply never reads it.
+        for (int L = nLev - 1; L >= 0; --L) {
+            int lw, lh, off, cw, ch, coff;
+            halLevelInfo(p_Width, p_Height, L,     lw, lh, off);
+            halLevelInfo(p_Width, p_Height, L + 1, cw, ch, coff);
+            dim3 gridL((lw + block.x - 1) / block.x, (lh + block.y - 1) / block.y, 1);
+            SpeakAccumKernel<<<gridL, block, 0, stream>>>(p_Params, p_Height, L, nLev,
+                                                          lw, lh, off, cw, ch, coff, res.arena);
+        }
+        SpeakNormalizeKernel<<<grid, block, 0, stream>>>(p_Params, p_Width, p_Height, nLev,
+                                                         res.arena, res.scat);
     }
 
     cudaMemsetAsync(res.stats, 0, SPEAK_STATS_UINTS * sizeof(unsigned int), stream);

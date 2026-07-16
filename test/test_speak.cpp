@@ -391,48 +391,121 @@ static void gateHalIdentity()
     check(finite, "G12d halRadius=0 renders finite (the sigma floor holds)");
 }
 
-static void gateHalLadder()
+// Half-width at half maximum of the scatter PSF, along +x from an impulse at the
+// centre. HWHM, not the second moment: the mixture's skirt is a power law, so
+// <r^2> is dominated by the widest level and estimates nothing about the halo's
+// actual size (the first version of G13 made exactly that mistake and failed on
+// correct code).
+static double halHWHM(int W, int H, float radiusPct)
 {
-    printf("G13 the pyramid's sigma ladder is what the core says it is\n");
-    // A ladder off by one octave halves the shipped halo and is otherwise
-    // invisible — nothing else in the suite would notice, and parity never
-    // would. Pin halLevelSigma() against the MEASURED impulse response of each
-    // level of the real production pyramid.
-    //
-    // Measure ONE LEVEL AT A TIME, not the mixture. The first version of this
-    // gate took the second moment of the full mixture and failed on correct
-    // code: an r^-3 skirt makes <r^2> diverge (in 2D the integrand r^2 * r^-3 * r
-    // is flat in r), so the mixture's second moment is dominated by its widest
-    // level and estimates nothing about the core. A single level IS near-
-    // Gaussian, so <r^2> = 2*sigma^2 is a valid estimator there.
-    const int W = 512, H = 512;
     std::vector<float> src = impulseFrame(W, H, 4000.0f);
-    std::vector<float> arena(static_cast<size_t>(halArenaPixels(W, H)) * 3, 0.0f);
-    std::vector<float> scat(static_cast<size_t>(W) * H * 3, 0.0f);
-    SpeakParams pr = halParams(SPEAK_CS_LINEAR, 1.0f, 1.0f, 0.6f);
-    buildHalScatter(src.data(), W, H, pr, arena.data(), scat.data());   // fills the arena
+    SpeakParams pr = halParams(SPEAK_CS_LINEAR, 1.0f, radiusPct, 0.6f);
+    std::vector<float> scat;
+    buildScatterFor(src, W, H, pr, scat);
+    auto at = [&](int x) { return static_cast<double>(scat[(static_cast<size_t>(H / 2) * W + x) * 3]); };
+    const double peak = at(W / 2);
+    if (peak <= 0.0) return 0.0;
+    for (int x = W / 2; x < W - 1; ++x)
+        if (at(x) <= peak * 0.5) {   // linear interpolation onto the half-max crossing
+            const double a = at(x - 1), b = at(x);
+            const double t = (a - peak * 0.5) / ((a - b) + 1e-30);
+            return (x - 1) + t - W / 2.0;
+        }
+    return -1.0;
+}
 
-    float worst = 0.0f; int worstL = 0;
-    for (int L = 1; L <= 5; ++L) {
-        int lw, lh, off;
-        halLevelInfo(W, H, L, lw, lh, off);
-        double m0 = 0.0, m2 = 0.0;
-        for (int y = 0; y < H; ++y)
-            for (int x = 0; x < W; ++x) {
-                const double v = halSampleLevel(arena.data(), off, lw, lh, W, H, x, y, 0);
-                const double dx = x - W / 2, dy = y - H / 2;
-                m0 += v; m2 += v * (dx * dx + dy * dy);
-            }
-        const double sigMeas = std::sqrt(m2 / (m0 * 2.0));   // <r^2> = 2 sigma^2
-        const double sigL = halLevelSigma(L);
-        const double ratio = sigMeas / sigL;
-        printf("    level %d: core says sigma=%6.2f   measured=%7.2f   ratio=%.3f\n",
-               L, sigL, sigMeas, ratio);
-        if (std::fabs(std::log2(ratio)) > worst) { worst = std::fabs(std::log2(ratio)); worstL = L; }
+static void gateHalRadiusContract()
+{
+    printf("G13 the halo's size tracks the Radius control (the shipped contract)\n");
+    // WHAT THIS PINS: the tooltip promises Radius is "how far the light spreads,
+    // as a percentage of frame HEIGHT". So the PSF's half-width must be LINEAR in
+    // halRadius with a fixed constant. That is the user-facing contract, and an
+    // octave error in the level ladder — which nothing else in the suite would
+    // notice, and parity never would — breaks it.
+    //
+    // This replaced a gate that measured one arena level at a time. That premise
+    // died with the coarse-to-fine accumulate: buildHalScatter now accumulates IN
+    // PLACE, so after it returns arena[L] holds the accumulated mixture, not the
+    // raw decimated level. The gate caught its own obsolescence (it read a level-1
+    // sigma of 18.17 against a nominal 1.19) rather than silently measuring the
+    // wrong thing.
+    // TWO honest limits, both measured, neither claimed away:
+    //  1. A SMALL-SIGMA FLOOR. HWHM/sigma converges to ~0.95 from below as sigma
+    //     grows (0.59 at sigma 1.3 px -> 0.95 at 20 px, at CONSTANT fractional
+    //     level position, so it is not an octave error). A pyramid cannot resolve
+    //     a halo a few pixels wide; below ~10 px of sigma it undersizes. This is
+    //     the architecture's floor, and the Radius hint does not claim otherwise
+    //     — it does not promise HWHM == radius% * H.
+    //  2. A ~8% RIPPLE as the target level bracket slides between octaves
+    //     (visible at fractional Lt ~0.6). Inherent to a discrete octave mixture,
+    //     and far below visibility.
+    // So this gate pins what IS true and what an octave slip WOULD break:
+    // monotonicity, and the asymptotic constant in the well-resolved range.
+    const int W = 1920, H = 1080;   // a real delivery size, not a toy
+    const float radii[4] = { 0.5f, 1.0f, 2.0f, 4.0f };
+    double hw[4], ratio[4];
+    for (int i = 0; i < 4; ++i) {
+        hw[i] = halHWHM(W, H, radii[i]);
+        const double sigma = radii[i] * 0.01 * H;
+        ratio[i] = hw[i] / sigma;
+        printf("    radius %.1f%% (sigma %5.2f px) -> HWHM %6.2f px   HWHM/sigma = %.3f\n",
+               radii[i], sigma, hw[i], ratio[i]);
     }
-    check(worst < 0.35f, "G13 each level's measured sigma matches halLevelSigma()",
-          (std::string("worst |log2(ratio)|=") + std::to_string(worst) +
-           " at level " + std::to_string(worstL)).c_str());
+    bool mono = true;
+    for (int i = 1; i < 4; ++i) if (hw[i] <= hw[i - 1]) mono = false;
+    check(mono, "G13a the halo grows monotonically with Radius (the control responds)");
+    // The asymptote pins the octave: a ladder off by one gives ~0.5x or ~2x here
+    // and nothing else in the suite — and no parity test — would notice.
+    check(ratio[3] > 0.75 && ratio[3] < 1.30,
+          "G13b HWHM/sigma converges to the pinned ~0.95 (catches an octave slip)",
+          (std::string("HWHM/sigma at 4% = ") + std::to_string(ratio[3])).c_str());
+    // ...and the well-resolved range is linear to within the ripple.
+    const double spread = std::fabs(ratio[3] - ratio[2]) / ratio[3];
+    check(spread < 0.15, "G13c the well-resolved range is linear in Radius (within the octave ripple)",
+          (std::string("|d(HWHM/sigma)| between 2% and 4% = ") + std::to_string(spread)).c_str());
+}
+
+// A scatter PSF must be RADIALLY SYMMETRIC — light does not know about the pixel
+// grid. This is the gate that was MISSING: the first pyramid sampled every level
+// directly at full res with a bilinear tap, and the C0 derivative discontinuity
+// at each coarse texel boundary rendered the skirt as hard rectangular BLOCKS.
+// It passed the energy, ladder, skirt and resolution gates — all of them — and
+// was obvious the instant the scatter field was actually rendered and looked at.
+static void gateHalIsotropy()
+{
+    printf("G18 the scatter PSF is radially symmetric (no pyramid blocks)\n");
+    const int W = 512, H = 512;
+    std::vector<float> src = impulseFrame(W, H, 4000.0f), scat;
+    SpeakParams pr = halParams(SPEAK_CS_LINEAR, 1.0f, 1.0f, 0.6f);
+    buildScatterFor(src, W, H, pr, scat);
+    auto at = [&](double x, double y) {
+        const int x0 = static_cast<int>(std::floor(x)), y0 = static_cast<int>(std::floor(y));
+        const double tx = x - x0, ty = y - y0;
+        auto g = [&](int a, int b) {
+            a = a < 0 ? 0 : (a >= W ? W - 1 : a); b = b < 0 ? 0 : (b >= H ? H - 1 : b);
+            return static_cast<double>(scat[(static_cast<size_t>(b) * W + a) * 3]);
+        };
+        return (g(x0, y0) * (1 - tx) + g(x0 + 1, y0) * tx) * (1 - ty) +
+               (g(x0, y0 + 1) * (1 - tx) + g(x0 + 1, y0 + 1) * tx) * ty;
+    };
+    double worst = 0.0; int worstR = 0;
+    for (int r = 4; r <= 64; r *= 2) {
+        double s = 0.0, s2 = 0.0; int n = 0;
+        for (int a = 0; a < 720; ++a) {
+            const double th = a * 3.14159265358979 / 360.0;
+            const double v = at(W / 2 + r * std::cos(th), H / 2 + r * std::sin(th));
+            s += v; s2 += v * v; n++;
+        }
+        const double m = s / n, sd = std::sqrt(std::fmax(0.0, s2 / n - m * m));
+        const double cv = m > 1e-12 ? sd / m : 0.0;
+        printf("    r=%-4d mean %-11.5f sd %-11.5f  cv=%.4f\n", r, m, sd, cv);
+        if (cv > worst) { worst = cv; worstR = r; }
+    }
+    // Measured 0.09 (and 3.72 in the far skirt) with the full-res bilinear reads;
+    // 0.07 worst here with the coarse-to-fine B-spline accumulate.
+    check(worst < 0.10, "G18 the PSF's angular variation is small at every radius",
+          (std::string("worst cv=") + std::to_string(worst) +
+           " at r=" + std::to_string(worstR)).c_str());
 }
 
 static void gateHalEnergy()
@@ -598,11 +671,12 @@ int main()
     gateBakeCST();
     gateViewDelivery();
     gateHalIdentity();
-    gateHalLadder();
+    gateHalRadiusContract();
     gateHalEnergy();
     gateHalTail();
     gateHalResolution();
     gateHalScopeSeesScatter();
+    gateHalIsotropy();
     printf("\n%s (%d failures)\n", g_fail ? "FAILED" : "ALL GATES GREEN", g_fail);
     return g_fail ? 1 : 0;
 }

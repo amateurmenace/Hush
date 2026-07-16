@@ -310,35 +310,83 @@ inline void halDecimatePixel(device const float* arena, int sOff, int sW, int sH
     }
 }
 
+// Cubic B-spline read of one level onto a (W,H) grid. B-spline, NOT bilinear and
+// NOT Catmull-Rom: it is C2 (bilinear is only C0, and its derivative
+// discontinuity at every texel boundary is what made the skirt read as hard
+// rectangular BLOCKS), and its weights are non-negative and sum to 1 (so no
+// undershoot below zero, and energy is preserved).
+inline void halBSpline(float t, thread float* w)
+{
+    float t2 = t * t, t3 = t2 * t;
+    w[0] = (1.0f - 3.0f * t + 3.0f * t2 - t3) * (1.0f / 6.0f);
+    w[1] = (4.0f - 6.0f * t2 + 3.0f * t3) * (1.0f / 6.0f);
+    w[2] = (1.0f + 3.0f * t + 3.0f * t2 - 3.0f * t3) * (1.0f / 6.0f);
+    w[3] = t3 * (1.0f / 6.0f);
+}
 inline float halSampleLevel(device const float* arena, int off, int lw, int lh,
                             int W, int H, int x, int y, int c)
 {
     float fx = (float(x) + 0.5f) * float(lw) / float(W) - 0.5f;
     float fy = (float(y) + 0.5f) * float(lh) / float(H) - 0.5f;
     int x0 = int(floor(fx)), y0 = int(floor(fy));
-    float tx = fx - float(x0), ty = fy - float(y0);
-    float a = lerpf(halFetch(arena, off, lw, lh, x0,     y0,     c),
-                    halFetch(arena, off, lw, lh, x0 + 1, y0,     c), tx);
-    float b = lerpf(halFetch(arena, off, lw, lh, x0,     y0 + 1, c),
-                    halFetch(arena, off, lw, lh, x0 + 1, y0 + 1, c), tx);
-    return lerpf(a, b, ty);
+    float wx[4], wy[4];
+    halBSpline(fx - float(x0), wx);
+    halBSpline(fy - float(y0), wy);
+    float acc = 0.0f;
+    for (int j = 0; j < 4; ++j) {
+        float row = 0.0f;
+        for (int i = 0; i < 4; ++i)
+            row += wx[i] * halFetch(arena, off, lw, lh, x0 - 1 + i, y0 - 1 + j, c);
+        acc += wy[j] * row;
+    }
+    return acc;
 }
 
-inline void halScatterAt(device const float* arena, int W, int H, int nLev,
-                         float sigmaTarget, int x, int y, thread float* out)
+// The mixture's total weight — the normalizer that makes the pyramid
+// energy-preserving. Same loop as speak_core.h on every backend.
+inline float halWeightSum(int nLev, float sigmaTarget)
 {
-    float acc[3]; acc[0] = 0.0f; acc[1] = 0.0f; acc[2] = 0.0f;
     float wsum = 0.0f;
-    for (int L = 0; L < nLev; ++L) {
-        float wl = halLevelWeight(L, sigmaTarget);
-        int lw, lh, off;
-        halLevelInfo(W, H, L, lw, lh, off);
-        for (int c = 0; c < 3; ++c)
-            acc[c] += wl * halSampleLevel(arena, off, lw, lh, W, H, x, y, c);
-        wsum += wl;
+    for (int L = 0; L < nLev; ++L) wsum += halLevelWeight(L, sigmaTarget);
+    return wsum;
+}
+
+// COARSE-TO-FINE ACCUMULATE — one pixel of level L (halAccumPixel in
+// speak_core.h):  acc_L = w_L * level_L + upsample_2x(acc_{L+1}), running
+// L = nLev-1 down to 0, in place in the arena. acc_0 is then the whole
+// (unnormalized) mixture at full resolution.
+//
+// Going one octave at a time is what fixes the blocky skirt: each step
+// interpolates only between ADJACENT samples and is then re-filtered by every
+// step below it. It is also strictly CHEAPER — total work sum_L (level L's
+// pixels) = 4/3 N, against nLev*N for the old full-res reads.
+//
+// IN-PLACE SAFETY: a thread reads its OWN (x,y) at level L plus a neighbourhood
+// at level L+1 — a DISJOINT arena region, finished by the previous dispatch —
+// and writes only its own (x,y) at level L. No thread reads another thread's
+// level-L pixel, so in place is safe and no atomics are involved.
+//
+// The level geometry (both levels' dims + offsets, L and nLev) is passed IN from
+// the host rather than recomputed from L in-kernel, exactly as SpeakDecimateKernel
+// does and for the same reason: this kernel binds `arena` WRITABLE, and the
+// back-to-back halLevelInfo calls were observed to misbehave under that binding.
+// The host computes them with the same halLevelInfo, so the two agree by
+// construction. `sigmaTarget` stays in-kernel so it cannot drift from the
+// normalize pass.
+struct HalAccum { int lw, lh, off, cw, ch, coff, L, nLev; };
+inline void halAccumPixel(device const float* arena, constant HalAccum& lv,
+                          float sigmaTarget, int x, int y, thread float* out)
+{
+    float wl = halLevelWeight(lv.L, sigmaTarget);
+    if (lv.L >= lv.nLev - 1) {                 // the coarsest level: nothing above it
+        for (int c = 0; c < 3; ++c) out[c] = wl * halFetch(arena, lv.off, lv.lw, lv.lh, x, y, c);
+        return;
     }
-    float inv = wsum > 0.0f ? (1.0f / wsum) : 0.0f;
-    for (int c = 0; c < 3; ++c) out[c] = acc[c] * inv;
+    // the coarser level is B-spline-upsampled ONTO LEVEL L's grid: the dst dims
+    // handed to halSampleLevel are (lw, lh), NOT (W, H).
+    for (int c = 0; c < 3; ++c)
+        out[c] = wl * halFetch(arena, lv.off, lv.lw, lv.lh, x, y, c)
+               + halSampleLevel(arena, lv.coff, lv.cw, lv.ch, lv.lw, lv.lh, x, y, c);
 }
 
 inline void lookLinear(float r, float g, float b,
@@ -583,9 +631,13 @@ inline void processPixel(float r, float g, float b,
     if (densityScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
 }
 
-// The scatter pyramid, mirroring buildHalScatter in speak_core.h. Three passes:
-// excess (full res, level 0) -> decimate (one dispatch per level) -> scatter
-// (full res). Atomics-free by construction: box decimation is order-independent.
+// The scatter pyramid, mirroring buildHalScatter in speak_core.h. Four passes:
+//   excess (full res, level 0)
+//   -> decimate  (one dispatch per level, L = 1..nLev-1, fine to coarse)
+//   -> accum     (one dispatch per level, L = nLev-1..0, coarse to fine, in place)
+//   -> normalize (full res)
+// Atomics-free by construction: the decimation is order-independent and the
+// accumulate is per-pixel with a disjoint read of the level above.
 
 // Level 0 of the arena: the per-channel scene-linear highlight excess.
 // THRESHOLD BEFORE DECIMATION — mean(max(0, l-t)) != max(0, mean(l)-t).
@@ -629,22 +681,46 @@ kernel void SpeakDecimateKernel(constant HalLevel& lv [[buffer(0)]],
     arena[o + 0] = v[0]; arena[o + 1] = v[1]; arena[o + 2] = v[2];
 }
 
-// Read the pyramid back at full res as the energy-normalized octave mixture.
-kernel void SpeakScatterKernel(constant SpeakParams& p [[buffer(0)]],
-                               constant int& W [[buffer(1)]],
-                               constant int& H [[buffer(2)]],
-                               device const float* arena [[buffer(3)]],
-                               device float* scat [[buffer(4)]],
-                               uint2 gid [[thread_position_in_grid]])
+// One octave of the coarse-to-fine accumulate, IN PLACE in the arena.
+// Dispatched once per level, from nLev-1 down to 0, on THAT LEVEL's grid, with a
+// barrier between levels: level L reads level L+1, written by the previous
+// dispatch. Mirrors buildHalScatter's accumulate loop.
+kernel void SpeakAccumKernel(constant SpeakParams& p [[buffer(0)]],
+                             constant int& H [[buffer(1)]],
+                             constant HalAccum& lv [[buffer(2)]],
+                             device float* arena [[buffer(3)]],
+                             uint2 gid [[thread_position_in_grid]])
+{
+    if ((int)gid.x >= lv.lw || (int)gid.y >= lv.lh) return;
+    int x = int(gid.x), y = int(gid.y);
+    float sig = halSigmaPx(H, p);
+    float v[3];
+    halAccumPixel(arena, lv, sig, x, y, v);
+    int o = (lv.off + y * lv.lw + x) * 3;
+    arena[o + 0] = v[0]; arena[o + 1] = v[1]; arena[o + 2] = v[2];
+}
+
+// Normalize level 0 of the accumulated arena into the scatter plane:
+// sum(w) = 1 => energy preserved. `inv` is recomputed here rather than passed in
+// from the host so it uses the very same in-kernel halLevelWeight the accumulate
+// used — a host-side sum through a different exp2/log2 would drift the whole
+// scatter field by a scale parity would then charge to the pyramid.
+kernel void SpeakNormalizeKernel(constant SpeakParams& p [[buffer(0)]],
+                                 constant int& W [[buffer(1)]],
+                                 constant int& H [[buffer(2)]],
+                                 device const float* arena [[buffer(3)]],
+                                 device float* scat [[buffer(4)]],
+                                 uint2 gid [[thread_position_in_grid]])
 {
     if ((int)gid.x >= W || (int)gid.y >= H) return;
     int x = int(gid.x), y = int(gid.y);
     int nLev = halLevelCount(W, H);
     float sig = halSigmaPx(H, p);
-    float v[3];
-    halScatterAt(arena, W, H, nLev, sig, x, y, v);
+    float inv = 1.0f / halWeightSum(nLev, sig);
     int o = (y * W + x) * 3;
-    scat[o + 0] = v[0]; scat[o + 1] = v[1]; scat[o + 2] = v[2];
+    scat[o + 0] = arena[o + 0] * inv;
+    scat[o + 1] = arena[o + 1] * inv;
+    scat[o + 2] = arena[o + 2] * inv;
 }
 
 // Scope measurement pass: bin the frame on a stride-2 grid. Integer atomics are
@@ -721,9 +797,11 @@ kernel void SpeakKernel(constant SpeakParams& p [[buffer(0)]],
 // ---------------------------------------------------------------------------
 
 // ---- halation host mirrors of speak_core.h (kept textually parallel) ----
-// Per-level geometry handed to SpeakDecimateKernel (layout must match the
-// HalLevel struct declared in the MSL source above; all fields 4 bytes).
+// Per-level geometry handed to SpeakDecimateKernel / SpeakAccumKernel (layout
+// must match the HalLevel / HalAccum structs declared in the MSL source above;
+// all fields 4 bytes).
 struct HalLevel { int sw, sh, so, dw, dh, doff; };
+struct HalAccum { int lw, lh, off, cw, ch, coff, L, nLev; };
 
 static int halLevelCount(int W, int H)
 {
@@ -761,7 +839,8 @@ struct SpeakRes {
     id<MTLComputePipelineState> statsMax = nil;
     id<MTLComputePipelineState> excess = nil;
     id<MTLComputePipelineState> decimate = nil;
-    id<MTLComputePipelineState> scatter = nil;
+    id<MTLComputePipelineState> accum = nil;
+    id<MTLComputePipelineState> normalize = nil;
     id<MTLBuffer> statsBuf = nil;
     // The scatter buffers are SIZE-DEPENDENT (unlike statsBuf, whose layout is
     // fixed): the host hands us proxy and full-res frames through the SAME queue,
@@ -817,10 +896,12 @@ void RunMetalSpeak(void* p_CmdQ, int p_Width, int p_Height,
             r.excess = [device newComputePipelineStateWithFunction:fe error:&err];
             id<MTLFunction> fd = [lib newFunctionWithName:@"SpeakDecimateKernel"];
             r.decimate = [device newComputePipelineStateWithFunction:fd error:&err];
-            id<MTLFunction> fc = [lib newFunctionWithName:@"SpeakScatterKernel"];
-            r.scatter = [device newComputePipelineStateWithFunction:fc error:&err];
+            id<MTLFunction> fa = [lib newFunctionWithName:@"SpeakAccumKernel"];
+            r.accum = [device newComputePipelineStateWithFunction:fa error:&err];
+            id<MTLFunction> fnm = [lib newFunctionWithName:@"SpeakNormalizeKernel"];
+            r.normalize = [device newComputePipelineStateWithFunction:fnm error:&err];
             if (!r.main || !r.stats || !r.statsMax ||
-                !r.excess || !r.decimate || !r.scatter) {
+                !r.excess || !r.decimate || !r.accum || !r.normalize) {
                 fprintf(stderr, "Speak: pipeline failed\n"); return;
             }
         }
@@ -900,7 +981,27 @@ void RunMetalSpeak(void* p_CmdQ, int p_Width, int p_Height,
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];   // level L-1 -> L
         }
 
-        [enc setComputePipelineState:res.scatter];
+        // Coarse-to-fine accumulate, in place, one octave at a time — one
+        // dispatch per level on THAT LEVEL's grid. The barrier between levels is
+        // REQUIRED: level L reads the neighbourhood of level L+1 that the
+        // previous dispatch just wrote.
+        for (int L = nLev - 1; L >= 0; --L) {
+            HalAccum lv;
+            halLevelInfo(W, H, L, lv.lw, lv.lh, lv.off);
+            if (L < nLev - 1) halLevelInfo(W, H, L + 1, lv.cw, lv.ch, lv.coff);
+            else              { lv.cw = 0; lv.ch = 0; lv.coff = 0; }   // unread: no level above
+            lv.L = L; lv.nLev = nLev;
+            [enc setComputePipelineState:res.accum];
+            [enc setBytes:&params length:sizeof(SpeakParams) atIndex:0];
+            [enc setBytes:&H length:sizeof(int) atIndex:1];
+            [enc setBytes:&lv length:sizeof(HalAccum) atIndex:2];
+            [enc setBuffer:res.arenaBuf offset:0 atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((lv.lw + 15) / 16, (lv.lh + 15) / 16, 1)
+                threadsPerThreadgroup:tg];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];   // level L+1 -> L
+        }
+
+        [enc setComputePipelineState:res.normalize];
         [enc setBytes:&params length:sizeof(SpeakParams) atIndex:0];
         [enc setBytes:&W length:sizeof(int) atIndex:1];
         [enc setBytes:&H length:sizeof(int) atIndex:2];

@@ -324,35 +324,89 @@ inline void halDecimatePixel(__global const float* arena, int sOff, int sW, int 
     }
 }
 
+// Cubic B-spline read of one level onto a (W,H) grid.
+//
+// B-spline, NOT bilinear and NOT Catmull-Rom, for two reasons that both matter
+// here: it is C2 (bilinear is only C0, and its derivative discontinuity at every
+// texel boundary is what made the skirt read as hard rectangular BLOCKS), and
+// its weights are NON-NEGATIVE and sum to 1 (Catmull-Rom's overshoot would
+// undershoot a scatter field below zero and break energy conservation). It is
+// approximating rather than interpolating — it blurs slightly — which for a
+// light-scatter field is exactly what is wanted.
+inline void halBSpline(float t, float* w)
+{
+    float t2 = t * t, t3 = t2 * t;
+    w[0] = (1.0f - 3.0f * t + 3.0f * t2 - t3) * (1.0f / 6.0f);
+    w[1] = (4.0f - 6.0f * t2 + 3.0f * t3) * (1.0f / 6.0f);
+    w[2] = (1.0f + 3.0f * t + 3.0f * t2 - 3.0f * t3) * (1.0f / 6.0f);
+    w[3] = t3 * (1.0f / 6.0f);
+}
 inline float halSampleLevel(__global const float* arena, int off, int lw, int lh,
                             int W, int H, int x, int y, int c)
 {
     float fx = ((float)x + 0.5f) * (float)lw / (float)W - 0.5f;
     float fy = ((float)y + 0.5f) * (float)lh / (float)H - 0.5f;
     int x0 = (int)floor(fx), y0 = (int)floor(fy);
-    float tx = fx - (float)x0, ty = fy - (float)y0;
-    float a = lerpf(halFetch(arena, off, lw, lh, x0,     y0,     c),
-                    halFetch(arena, off, lw, lh, x0 + 1, y0,     c), tx);
-    float b = lerpf(halFetch(arena, off, lw, lh, x0,     y0 + 1, c),
-                    halFetch(arena, off, lw, lh, x0 + 1, y0 + 1, c), tx);
-    return lerpf(a, b, ty);
+    float wx[4], wy[4];
+    halBSpline(fx - (float)x0, wx);
+    halBSpline(fy - (float)y0, wy);
+    float acc = 0.0f;
+    for (int j = 0; j < 4; ++j) {
+        float row = 0.0f;
+        for (int i = 0; i < 4; ++i)
+            row += wx[i] * halFetch(arena, off, lw, lh, x0 - 1 + i, y0 - 1 + j, c);
+        acc += wy[j] * row;
+    }
+    return acc;
 }
 
-inline void halScatterAt(__global const float* arena, int W, int H, int nLev,
-                         float sigmaTarget, int x, int y, float* out)
+// The mixture's total weight — the normalizer that makes the pyramid
+// energy-preserving (each level is mean-preserving, so a convex combination of
+// them carries exactly the source's energy). Same loop on every backend.
+inline float halWeightSum(int nLev, float sigmaTarget)
 {
-    float acc[3]; acc[0] = 0.0f; acc[1] = 0.0f; acc[2] = 0.0f;
     float wsum = 0.0f;
-    for (int L = 0; L < nLev; ++L) {
-        float wl = halLevelWeight(L, sigmaTarget);
-        int lw, lh, off;
-        halLevelInfo(W, H, L, &lw, &lh, &off);
-        for (int c = 0; c < 3; ++c)
-            acc[c] += wl * halSampleLevel(arena, off, lw, lh, W, H, x, y, c);
-        wsum += wl;
+    for (int L = 0; L < nLev; ++L) wsum += halLevelWeight(L, sigmaTarget);
+    return wsum;
+}
+
+// COARSE-TO-FINE ACCUMULATE — one pixel of level L.
+//     acc_L = w_L * level_L + upsample_2x(acc_{L+1})
+// running L = nLev-1 down to 0, in place in the arena. acc_0 is then the whole
+// (unnormalized) mixture at full resolution.
+//
+// WHY NOT SAMPLE EVERY LEVEL DIRECTLY AT FULL RES (what this replaced): reading
+// a coarse level at full res interpolates between texels 2^L px apart, and
+// bilinear is only C0 — the derivative discontinuity at every texel boundary
+// reads as VISIBLE RECTANGULAR BLOCKS, worst on exactly the coarse levels that
+// carry the skirt. It shipped past every numeric gate (energy, ladder, tail,
+// resolution) because none of them measured isotropy. Going one octave at a time
+// fixes it because each step interpolates only between ADJACENT samples and is
+// then re-filtered by every step below it. It is also strictly CHEAPER: the
+// total work is sum_L (level L's pixels) = 4/3 N, against nLev*N.
+//
+// IN-PLACE IS SAFE: a thread reads its OWN (x,y) at level L and a neighbourhood
+// at level L+1 (a disjoint arena region), and writes only its own (x,y) at
+// level L. Ordering BETWEEN levels is the only requirement (see the host's
+// per-level barriers).
+//
+// The level geometry arrives as ARGUMENTS rather than being derived here from L,
+// for the same reason SpeakDecimateKernel takes it — see that kernel's header:
+// Apple's OpenCL optimizer miscompiles in-kernel halLevelInfo feeding halFetch's
+// clamped tap addressing. The host computes it with its own textual mirror of
+// halLevelInfo, so the body below stays a line-for-line port of the core's.
+inline void halAccumPixel(__global float* arena, int L, int nLev, float sigmaTarget,
+                          int lw, int lh, int off, int cw, int ch, int coff,
+                          int x, int y, float* out)
+{
+    float wl = halLevelWeight(L, sigmaTarget);
+    if (L >= nLev - 1) {                       // the coarsest level: nothing above it
+        for (int c = 0; c < 3; ++c) out[c] = wl * halFetch(arena, off, lw, lh, x, y, c);
+        return;
     }
-    float inv = wsum > 0.0f ? (1.0f / wsum) : 0.0f;
-    for (int c = 0; c < 3; ++c) out[c] = acc[c] * inv;
+    for (int c = 0; c < 3; ++c)
+        out[c] = wl * halFetch(arena, off, lw, lh, x, y, c)
+               + halSampleLevel(arena, coff, cw, ch, lw, lh, x, y, c);
 }
 
 inline void lookLinear(float r, float g, float b,
@@ -602,11 +656,12 @@ inline void processPixel(float r, float g, float b,
 }
 
 // ---------------------------------------------------------------------------
-// The scatter pyramid, mirroring buildHalScatter in speak_core.h. Three passes:
-//   excess (full res, level 0) -> decimate (once per level) -> scatter (full
-// res). The host skips all three when halation is inactive, and the readers
-// below gate on the SAME condition, so nothing ever touches the placeholder
-// binding that stands in for the buffers in that case.
+// The scatter pyramid, mirroring buildHalScatter in speak_core.h. Four passes:
+//   excess (full res, level 0) -> decimate (once per level, fine to coarse) ->
+//   accum (once per level, COARSE TO FINE, in place) -> normalize (full res).
+// The host skips them all when halation is inactive, and the readers below gate
+// on the SAME condition, so nothing ever touches the placeholder binding that
+// stands in for the buffers in that case.
 // ---------------------------------------------------------------------------
 
 // Level 0: the per-channel scene-linear highlight excess. THRESHOLD BEFORE
@@ -657,19 +712,40 @@ __kernel void SpeakDecimateKernel(int sw, int sh, int so, int dw, int dh, int do
     arena[o + 0] = v[0]; arena[o + 1] = v[1]; arena[o + 2] = v[2];
 }
 
-// Read the pyramid back at full res as the energy-normalized octave mixture.
-__kernel void SpeakScatterKernel(SpeakParams p, int W, int H,
-                                 __global const float* arena, __global float* scat)
+// One dispatch per level L = nLev-1 down to 0, COARSE TO FINE, with the grid set
+// to LEVEL L's dims: acc_L = w_L * level_L + upsample_2x(acc_{L+1}), written IN
+// PLACE. Level L reads level L+1, which the PREVIOUS dispatch wrote, so the
+// host's barrier between levels is required. Geometry comes in as args (see
+// halAccumPixel's header). `cw/ch/coff` are level L+1's and are unread at
+// L == nLev-1.
+__kernel void SpeakAccumKernel(SpeakParams p, int H, int L, int nLev,
+                               int lw, int lh, int off, int cw, int ch, int coff,
+                               __global float* arena)
+{
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    if (x >= lw || y >= lh) return;
+    float sig = halSigmaPx(H, &p);
+    float v[3];
+    halAccumPixel(arena, L, nLev, sig, lw, lh, off, cw, ch, coff, x, y, v);
+    size_t o = ((size_t)off + (size_t)y * lw + x) * 3;
+    arena[o + 0] = v[0]; arena[o + 1] = v[1]; arena[o + 2] = v[2];
+}
+
+// Normalize level 0 into the scatter plane: sum(w) = 1 => energy preserved.
+__kernel void SpeakNormalizeKernel(SpeakParams p, int W, int H,
+                                   __global const float* arena, __global float* scat)
 {
     int x = get_global_id(0);
     int y = get_global_id(1);
     if (x >= W || y >= H) return;
     int nLev = halLevelCount(W, H);
     float sig = halSigmaPx(H, &p);
-    float v[3];
-    halScatterAt(arena, W, H, nLev, sig, x, y, v);
-    size_t o = ((size_t)y * W + x) * 3;
-    scat[o + 0] = v[0]; scat[o + 1] = v[1]; scat[o + 2] = v[2];
+    float inv = 1.0f / halWeightSum(nLev, sig);
+    size_t k = ((size_t)y * W + x) * 3;
+    scat[k + 0] = arena[k + 0] * inv;
+    scat[k + 1] = arena[k + 1] * inv;
+    scat[k + 2] = arena[k + 2] * inv;
 }
 
 // Scope measurement pass: bin the frame on a stride-2 grid. Integer atomics are
@@ -804,7 +880,8 @@ struct SpeakRes {
     cl_kernel kMax = NULL;      // bin-max finalize
     cl_kernel kExcess = NULL;   // scatter pyramid: level 0 highlight excess
     cl_kernel kDecimate = NULL; // scatter pyramid: level L from level L-1
-    cl_kernel kScatter = NULL;  // scatter pyramid: full-res octave mixture
+    cl_kernel kAccum = NULL;    // scatter pyramid: coarse-to-fine accumulate, in place
+    cl_kernel kNorm = NULL;     // scatter pyramid: normalize level 0 into the plane
     cl_mem stats = NULL;
     // Unlike `stats` (fixed size, allocated once), these two are SIZE-DEPENDENT:
     // the OFX host hands us any image size and it changes between renders (proxy
@@ -873,8 +950,10 @@ void RunOpenCLSpeak(void* p_CmdQ, int p_Width, int p_Height,
             SpeakCheck(error, "create excess kernel");
             r.kDecimate = clCreateKernel(program, "SpeakDecimateKernel", &error);
             SpeakCheck(error, "create decimate kernel");
-            r.kScatter = clCreateKernel(program, "SpeakScatterKernel", &error);
-            SpeakCheck(error, "create scatter kernel");
+            r.kAccum = clCreateKernel(program, "SpeakAccumKernel", &error);
+            SpeakCheck(error, "create accum kernel");
+            r.kNorm = clCreateKernel(program, "SpeakNormalizeKernel", &error);
+            SpeakCheck(error, "create normalize kernel");
         }
         if (!r.stats)
             r.stats = clCreateBuffer(clContext, CL_MEM_READ_WRITE,
@@ -900,7 +979,8 @@ void RunOpenCLSpeak(void* p_CmdQ, int p_Width, int p_Height,
 
     const size_t local[2] = { 16, 16 };
 
-    // ---- the scatter pyramid: excess -> decimate(L=1..nLev-1) -> scatter ----
+    // ---- the scatter pyramid ----
+    //   excess -> decimate(L=1..nLev-1) -> accum(L=nLev-1..0) -> normalize
     // Every pass depends on the previous one, and the queue is NOT ours (Resolve
     // hands it in), so we cannot assume it was created in-order. A barrier costs
     // nothing on an in-order queue and is what makes an out-of-order one correct.
@@ -939,15 +1019,43 @@ void RunOpenCLSpeak(void* p_CmdQ, int p_Width, int p_Height,
             clEnqueueBarrierWithWaitList(cmdQ, 0, NULL, NULL);
         }
 
+        // Coarse-to-fine accumulate, in place, one octave at a time — the same
+        // loop buildHalScatter runs, with level L's pixel loop become the grid.
+        // The barrier after each level is REQUIRED, not defensive: level L reads
+        // level L+1, which the previous dispatch wrote.
+        for (int L = nLev - 1; L >= 0; --L) {
+            int lw, lh, off, cw, ch, coff;
+            halLevelInfo(W, H, L,     lw, lh, off);
+            halLevelInfo(W, H, L + 1, cw, ch, coff);
+            int c2 = 0;
+            error  = clSetKernelArg(res.kAccum, c2++, sizeof(SpeakParams), &params);
+            error |= clSetKernelArg(res.kAccum, c2++, sizeof(int), &H);
+            error |= clSetKernelArg(res.kAccum, c2++, sizeof(int), &L);
+            error |= clSetKernelArg(res.kAccum, c2++, sizeof(int), &nLev);
+            error |= clSetKernelArg(res.kAccum, c2++, sizeof(int), &lw);
+            error |= clSetKernelArg(res.kAccum, c2++, sizeof(int), &lh);
+            error |= clSetKernelArg(res.kAccum, c2++, sizeof(int), &off);
+            error |= clSetKernelArg(res.kAccum, c2++, sizeof(int), &cw);
+            error |= clSetKernelArg(res.kAccum, c2++, sizeof(int), &ch);
+            error |= clSetKernelArg(res.kAccum, c2++, sizeof(int), &coff);
+            error |= clSetKernelArg(res.kAccum, c2++, sizeof(cl_mem), &res.arena);
+            SpeakCheck(error, "set accum args");
+            const size_t globalL[2] = { static_cast<size_t>((lw + 15) / 16) * 16,
+                                        static_cast<size_t>((lh + 15) / 16) * 16 };
+            error = clEnqueueNDRangeKernel(cmdQ, res.kAccum, 2, NULL, globalL, local, 0, NULL, NULL);
+            SpeakCheck(error, "enqueue accum");
+            clEnqueueBarrierWithWaitList(cmdQ, 0, NULL, NULL);
+        }
+
         c = 0;
-        error  = clSetKernelArg(res.kScatter, c++, sizeof(SpeakParams), &params);
-        error |= clSetKernelArg(res.kScatter, c++, sizeof(int), &W);
-        error |= clSetKernelArg(res.kScatter, c++, sizeof(int), &H);
-        error |= clSetKernelArg(res.kScatter, c++, sizeof(cl_mem), &res.arena);
-        error |= clSetKernelArg(res.kScatter, c++, sizeof(cl_mem), &res.scat);
-        SpeakCheck(error, "set scatter args");
-        error = clEnqueueNDRangeKernel(cmdQ, res.kScatter, 2, NULL, globalF, local, 0, NULL, NULL);
-        SpeakCheck(error, "enqueue scatter");
+        error  = clSetKernelArg(res.kNorm, c++, sizeof(SpeakParams), &params);
+        error |= clSetKernelArg(res.kNorm, c++, sizeof(int), &W);
+        error |= clSetKernelArg(res.kNorm, c++, sizeof(int), &H);
+        error |= clSetKernelArg(res.kNorm, c++, sizeof(cl_mem), &res.arena);
+        error |= clSetKernelArg(res.kNorm, c++, sizeof(cl_mem), &res.scat);
+        SpeakCheck(error, "set normalize args");
+        error = clEnqueueNDRangeKernel(cmdQ, res.kNorm, 2, NULL, globalF, local, 0, NULL, NULL);
+        SpeakCheck(error, "enqueue normalize");
         clEnqueueBarrierWithWaitList(cmdQ, 0, NULL, NULL);
     }
 

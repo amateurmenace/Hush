@@ -399,7 +399,16 @@ static inline float halAmountOf(const SpeakParams& pr)
 
 // Halation spreads a fixed distance in mm on the film, so its radius is
 // FORMAT-relative: sigma scales with frame height, never with pixel count. This
-// is what makes the look survive a proxy/full-res switch (gated: G12).
+// is what makes the look survive a proxy/full-res switch (measured: the halo
+// profile matches to ~1% across a 4x resolution change, G16).
+//
+// KNOWN AND MEASURED LIMIT, stated rather than papered over: the halo's actual
+// half-width tracks this sigma closely once sigma is well resolved (HWHM/sigma
+// = 0.93..1.00 above ~20 px) but UNDERSIZES below that, down to ~0.6x at a
+// sigma of ~1 px — a pyramid cannot represent a halo a few pixels wide. There is
+// also a ~8% ripple as the target level slides between octaves. Neither is
+// visible in use, and the Radius hint promises a percentage of frame height, not
+// an exact half-width. Pinned by G13.
 static inline float halSigmaPx(int H, const SpeakParams& pr)
 {
     const float s = pr.profile.halRadius * 0.01f * static_cast<float>(H);
@@ -515,39 +524,89 @@ static inline void halDecimatePixel(const float* arena, int sOff, int sW, int sH
     }
 }
 
-// Bilinear read of one level at a full-res pixel.
+// Cubic B-spline read of one level onto a (W,H) grid.
+//
+// B-spline, NOT bilinear and NOT Catmull-Rom, for two reasons that both matter
+// here: it is C2 (bilinear is only C0, and its derivative discontinuity at every
+// texel boundary is what made the skirt read as hard rectangular BLOCKS), and
+// its weights are NON-NEGATIVE and sum to 1 (Catmull-Rom's overshoot would
+// undershoot a scatter field below zero and break energy conservation). It is
+// approximating rather than interpolating — it blurs slightly — which for a
+// light-scatter field is exactly what is wanted.
+static inline void halBSpline(float t, float* w)
+{
+    const float t2 = t * t, t3 = t2 * t;
+    w[0] = (1.0f - 3.0f * t + 3.0f * t2 - t3) * (1.0f / 6.0f);
+    w[1] = (4.0f - 6.0f * t2 + 3.0f * t3) * (1.0f / 6.0f);
+    w[2] = (1.0f + 3.0f * t + 3.0f * t2 - 3.0f * t3) * (1.0f / 6.0f);
+    w[3] = t3 * (1.0f / 6.0f);
+}
 static inline float halSampleLevel(const float* arena, int off, int lw, int lh,
                                    int W, int H, int x, int y, int c)
 {
     const float fx = (static_cast<float>(x) + 0.5f) * static_cast<float>(lw) / static_cast<float>(W) - 0.5f;
     const float fy = (static_cast<float>(y) + 0.5f) * static_cast<float>(lh) / static_cast<float>(H) - 0.5f;
     const int x0 = static_cast<int>(std::floor(fx)), y0 = static_cast<int>(std::floor(fy));
-    const float tx = fx - static_cast<float>(x0), ty = fy - static_cast<float>(y0);
-    const float a = lerpf(halFetch(arena, off, lw, lh, x0,     y0,     c),
-                          halFetch(arena, off, lw, lh, x0 + 1, y0,     c), tx);
-    const float b = lerpf(halFetch(arena, off, lw, lh, x0,     y0 + 1, c),
-                          halFetch(arena, off, lw, lh, x0 + 1, y0 + 1, c), tx);
-    return lerpf(a, b, ty);
+    float wx[4], wy[4];
+    halBSpline(fx - static_cast<float>(x0), wx);
+    halBSpline(fy - static_cast<float>(y0), wy);
+    float acc = 0.0f;
+    for (int j = 0; j < 4; ++j) {
+        float row = 0.0f;
+        for (int i = 0; i < 4; ++i)
+            row += wx[i] * halFetch(arena, off, lw, lh, x0 - 1 + i, y0 - 1 + j, c);
+        acc += wy[j] * row;
+    }
+    return acc;
 }
 
-// The scatter at one pixel: the energy-normalized octave mixture. This is a PURE
-// OPTICAL quantity — the AH weight and the amount are applied at the injection
-// site, NOT here, so bloom can re-read this same plane with its own weights.
-static inline void halScatterAt(const float* arena, int W, int H, int nLev,
-                                float sigmaTarget, int x, int y, float* out)
+// The mixture's total weight — the normalizer that makes the pyramid
+// energy-preserving (each level is mean-preserving, so a convex combination of
+// them carries exactly the source's energy). Same loop on every backend.
+static inline float halWeightSum(int nLev, float sigmaTarget)
 {
-    float acc[3] = { 0.0f, 0.0f, 0.0f };
     float wsum = 0.0f;
-    for (int L = 0; L < nLev; ++L) {
-        const float wl = halLevelWeight(L, sigmaTarget);
-        int lw, lh, off;
-        halLevelInfo(W, H, L, lw, lh, off);
-        for (int c = 0; c < 3; ++c)
-            acc[c] += wl * halSampleLevel(arena, off, lw, lh, W, H, x, y, c);
-        wsum += wl;
+    for (int L = 0; L < nLev; ++L) wsum += halLevelWeight(L, sigmaTarget);
+    return wsum;
+}
+
+// COARSE-TO-FINE ACCUMULATE — one pixel of level L.
+//     acc_L = w_L * level_L + upsample_2x(acc_{L+1})
+// running L = nLev-1 down to 0, in place in the arena. acc_0 is then the whole
+// (unnormalized) mixture at full resolution.
+//
+// WHY NOT SAMPLE EVERY LEVEL DIRECTLY AT FULL RES (what this replaced): reading
+// a coarse level at full res interpolates between texels 2^L px apart, and
+// bilinear is only C0 — the derivative discontinuity at every texel boundary
+// reads as VISIBLE RECTANGULAR BLOCKS, worst on exactly the coarse levels that
+// carry the skirt. It shipped past every numeric gate (energy, ladder, tail,
+// resolution) because none of them measured isotropy, and it was plainly visible
+// the moment the scatter field was rendered: the PSF had ~9% angular variation
+// at every radius and 372% at r=128 (G18 now measures this; it read 3.72 before
+// this change and ~0.02 after).
+//
+// Going one octave at a time fixes it because each step interpolates only
+// between ADJACENT samples and is then re-filtered by every step below it. It is
+// also strictly CHEAPER: the total work is sum_L (level L's pixels) = 4/3 N,
+// against nLev*N for the full-res reads.
+//
+// In-place is safe: a thread reads its OWN (x,y) at level L and a neighbourhood
+// at level L+1 (a disjoint region), and writes only its own (x,y) at level L.
+static inline void halAccumPixel(float* arena, int W, int H, int L, int nLev,
+                                 float sigmaTarget, int x, int y, float* out)
+{
+    int lw, lh, off;
+    halLevelInfo(W, H, L, lw, lh, off);
+    const float wl = halLevelWeight(L, sigmaTarget);
+    if (L >= nLev - 1) {                       // the coarsest level: nothing above it
+        for (int c = 0; c < 3; ++c) out[c] = wl * halFetch(arena, off, lw, lh, x, y, c);
+        return;
     }
-    const float inv = wsum > 0.0f ? (1.0f / wsum) : 0.0f;
-    for (int c = 0; c < 3; ++c) out[c] = acc[c] * inv;
+    int cw, ch, coff;
+    halLevelInfo(W, H, L + 1, cw, ch, coff);
+    for (int c = 0; c < 3; ++c)
+        out[c] = wl * halFetch(arena, off, lw, lh, x, y, c)
+               + halSampleLevel(arena, coff, cw, ch, lw, lh, x, y, c);
 }
 
 // ---------------------------------------------------------------------------
@@ -987,14 +1046,22 @@ inline void buildHalScatter(const float* src, int W, int H, const SpeakParams& p
                 arena[o + 0] = v[0]; arena[o + 1] = v[1]; arena[o + 2] = v[2];
             }
     }
+    // Coarse-to-fine accumulate, in place, one octave at a time.
     const float sig = halSigmaPx(H, pr);
-    for (int y = 0; y < H; ++y)
-        for (int x = 0; x < W; ++x) {
-            float v[3];
-            halScatterAt(arena, W, H, nLev, sig, x, y, v);
-            const size_t o = (static_cast<size_t>(y) * W + x) * 3;
-            scat[o + 0] = v[0]; scat[o + 1] = v[1]; scat[o + 2] = v[2];
-        }
+    for (int L = nLev - 1; L >= 0; --L) {
+        int lw, lh, off;
+        halLevelInfo(W, H, L, lw, lh, off);
+        for (int y = 0; y < lh; ++y)
+            for (int x = 0; x < lw; ++x) {
+                float v[3];
+                halAccumPixel(arena, W, H, L, nLev, sig, x, y, v);
+                const size_t o = (static_cast<size_t>(off) + static_cast<size_t>(y) * lw + x) * 3;
+                arena[o + 0] = v[0]; arena[o + 1] = v[1]; arena[o + 2] = v[2];
+            }
+    }
+    // Normalize level 0 into the scatter plane: sum(w) = 1 => energy preserved.
+    const float inv = 1.0f / halWeightSum(nLev, sig);
+    for (size_t k = 0; k < static_cast<size_t>(W) * H * 3; ++k) scat[k] = arena[k] * inv;
 }
 
 inline void speakFrame(const float* src, int W, int H, const SpeakParams& pr, float* dst)

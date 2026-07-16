@@ -14,7 +14,9 @@ cd "$(dirname "$0")"
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT
 printf '// empty shim — declarations come from cuda_shim.cuh (-include)\n' > "$tmpdir/cuda_runtime.h"
-for f in ../plugin/CudaKernel.cu ../plugin/SpeakCudaKernel.cu; do
+# Glob, not a hardcoded list: the same script serves the Hush repo, the Speak
+# repo, and any tree with both (a missing hardcoded file would abort the loop).
+for f in ../plugin/*.cu; do
   clang++ -x cuda --cuda-host-only -nocudainc -nocudalib -fsyntax-only -std=c++14 \
     -include cuda_shim.cuh -I"$tmpdir" -I../plugin "$f"
   echo "  ok: $f"

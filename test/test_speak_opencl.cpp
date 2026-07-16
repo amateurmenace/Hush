@@ -115,6 +115,16 @@ int main()
     { SpeakParams p = baseParams(); p.outputMode = SPEAK_OUT_BAKE_REC709; p.profile = stockProfile(); run(W, H, p, "bake Rec.709 s1.0", 2); }
     { SpeakParams p = baseParams(); p.outputMode = SPEAK_OUT_BAKE_REC709; p.strength = 0.0f; run(W, H, p, "bake Rec.709 CST-only", 2); }
     { SpeakParams p = baseParams(); p.outputMode = SPEAK_OUT_BAKE_REC709; p.viewMode = SPEAK_VIEW_SPLIT; p.profile = stockProfile(); run(W, H, p, "bake + split view", 2); }
+    { SpeakParams p = baseParams(); p.strength = 0.0f; p.enableDye = 1;
+      p.profile.subSat[0] = p.profile.subSat[1] = p.profile.subSat[2] = 0.55f;
+      speakcore::setDyeCoupler(p.profile, 1.0f);
+      p.profile.subSatKnee[0] = p.profile.subSatKnee[1] = p.profile.subSatKnee[2] = 2.2f;
+      run(W, H, p, "subtractive color standalone", 0); }
+    { SpeakParams p = baseParams(); p.profile = stockProfile(); p.enableDye = 1;
+      p.profile.subSat[0] = p.profile.subSat[1] = p.profile.subSat[2] = 0.8f;
+      speakcore::setDyeCoupler(p.profile, 0.7f);
+      p.profile.subSatKnee[0] = p.profile.subSatKnee[1] = p.profile.subSatKnee[2] = 2.2f;
+      run(W, H, p, "tone + subtractive color", 0); }
     { SpeakParams p = baseParams(); p.scopeHD = 1; p.strength = 0.6f; p.profile = stockProfile(); run(W, H, p, "scope H&D on s0.6", 1); }
 
     printf("\n%s (%d failures)\n", g_fail ? "PARITY FAILED" : "PARITY GREEN", g_fail);

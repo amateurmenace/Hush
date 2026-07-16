@@ -127,6 +127,36 @@ __device__ inline float toneChannel(float lin, int ch, const SpeakProfile& p)
     float Dref = chainDensity(0.0f, ch, p);
     return k18Gray * pow10f(-(Dprn - Dref));
 }
+__device__ inline float density10(float lin)
+{
+    return -log2f(lin < 1e-6f ? 1e-6f : lin) * kLog10_2;
+}
+__device__ inline float softCapKnee(float d, float cap)
+{
+    if (cap <= 0.0f) return d;
+    return cap - (1.0f / 8.0f) * softplusf(8.0f * (cap - d));
+}
+__device__ inline void subtractiveColor(float r, float g, float b, const SpeakProfile& p,
+                                        float& oR, float& oG, float& oB)
+{
+    float DR = density10(r), DG = density10(g), DB = density10(b);
+    float Dbar = (DR + DG + DB) * (1.0f / 3.0f);
+    float devR = DR - Dbar, devG = DG - Dbar, devB = DB - Dbar;
+    float cR = (1.0f + p.subSat[0]) * devR - (p.dyeCouple[1] * devG + p.dyeCouple[2] * devB);
+    float cG = (1.0f + p.subSat[1]) * devG - (p.dyeCouple[3] * devR + p.dyeCouple[5] * devB);
+    float cB = (1.0f + p.subSat[2]) * devB - (p.dyeCouple[6] * devR + p.dyeCouple[7] * devG);
+    float DpR = softCapKnee(Dbar + cR, p.subSatKnee[0]);
+    float DpG = softCapKnee(Dbar + cG, p.subSatKnee[1]);
+    float DpB = softCapKnee(Dbar + cB, p.subSatKnee[2]);
+    oR = pow10f(-DpR); oG = pow10f(-DpG); oB = pow10f(-DpB);
+}
+__device__ inline bool dyeActive(const SpeakProfile& p)
+{
+    return p.subSat[0] != 0.0f || p.subSat[1] != 0.0f || p.subSat[2] != 0.0f ||
+           p.dyeCouple[1] != 0.0f || p.dyeCouple[2] != 0.0f || p.dyeCouple[3] != 0.0f ||
+           p.dyeCouple[5] != 0.0f || p.dyeCouple[6] != 0.0f || p.dyeCouple[7] != 0.0f;
+}
+
 __device__ inline float scopeYStops(float inStops, int ch, const SpeakParams& pr)
 {
     float lin = k18Gray * exp2f(inStops);
@@ -220,8 +250,9 @@ __device__ inline void processPixel(float r, float g, float b, int x, int y, int
 {
     int cs = pr.inputColorSpace;
     bool toneOn = (pr.enableTone != 0) && (pr.strength > 0.0f);
+    bool dyeOn = (pr.enableDye != 0) && dyeActive(pr.profile);
     bool bake = (pr.outputMode == 1);
-    if (!toneOn && !bake) {
+    if (!toneOn && !dyeOn && !bake) {
         outR = r; outG = g; outB = b;
     } else {
         float lr = decodeToLinear(cs, r);
@@ -234,6 +265,7 @@ __device__ inline void processPixel(float r, float g, float b, int x, int y, int
             mg = lerpf(lg, toneChannel(lg, 1, pr.profile), s);
             mb = lerpf(lb, toneChannel(lb, 2, pr.profile), s);
         }
+        if (dyeOn) subtractiveColor(mr, mg, mb, pr.profile, mr, mg, mb);
         if (bake) {
             float rr, rg, rb;
             gamutToRec709Lin(cs, mr, mg, mb, rr, rg, rb);

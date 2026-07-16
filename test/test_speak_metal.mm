@@ -132,6 +132,17 @@ int main()
     // 5d — Bake + Split view (both halves must land in Rec.709).
     { SpeakParams p = baseParams(); p.outputMode = SPEAK_OUT_BAKE_REC709; p.viewMode = SPEAK_VIEW_SPLIT; p.profile = stockProfile();
       run(device, queue, W, H, p, "bake + split view", 2); }
+    // 5e — Subtractive color (Phase 2): dye standalone, and dye + tone.
+    { SpeakParams p = baseParams(); p.strength = 0.0f; p.enableDye = 1;
+      p.profile.subSat[0] = p.profile.subSat[1] = p.profile.subSat[2] = 0.55f;
+      speakcore::setDyeCoupler(p.profile, 1.0f);
+      p.profile.subSatKnee[0] = p.profile.subSatKnee[1] = p.profile.subSatKnee[2] = 2.2f;
+      run(device, queue, W, H, p, "subtractive color standalone", 0); }
+    { SpeakParams p = baseParams(); p.profile = stockProfile(); p.enableDye = 1;
+      p.profile.subSat[0] = p.profile.subSat[1] = p.profile.subSat[2] = 0.8f;
+      speakcore::setDyeCoupler(p.profile, 0.7f);
+      p.profile.subSatKnee[0] = p.profile.subSatKnee[1] = p.profile.subSatKnee[2] = 2.2f;
+      run(device, queue, W, H, p, "tone + subtractive color", 0); }
     // 6 — H&D scope on (hud-tolerant).
     { SpeakParams p = baseParams(); p.scopeHD = 1; p.strength = 0.6f; p.profile = stockProfile();
       run(device, queue, W, H, p, "scope H&D on s0.6", 1); }

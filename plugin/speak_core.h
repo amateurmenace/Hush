@@ -155,6 +155,28 @@ static inline void gamutToRec709Lin(int cs, float r, float g, float b,
     }
 }
 
+// CIE L*a*b* (D65) — the perceptual metric the Phase-2 control arm scores in.
+// Used by the Macbeth gate and (later) the subtractive-sat vector scope.
+static inline float labF(float t)
+{
+    const float d = 6.0f / 29.0f;
+    return (t > d * d * d) ? std::cbrt(t) : (t / (3.0f * d * d) + 4.0f / 29.0f);
+}
+static inline void xyzToLab(float X, float Y, float Z, float& L, float& a, float& b)
+{
+    const float Xn = 0.95047f, Yn = 1.0f, Zn = 1.08883f;
+    const float fx = labF(X / Xn), fy = labF(Y / Yn), fz = labF(Z / Zn);
+    L = 116.0f * fy - 16.0f;
+    a = 500.0f * (fx - fy);
+    b = 200.0f * (fy - fz);
+}
+static inline void dwgLinToLab(float r, float g, float b, float& L, float& aa, float& bb)
+{
+    float X, Y, Z;
+    mul3(kDWG_to_XYZ, r, g, b, X, Y, Z);
+    xyzToLab(X, Y, Z, L, aa, bb);
+}
+
 // ---------------------------------------------------------------------------
 // The closed-form Hurter-Driffield characteristic curve  D(logH).
 //
@@ -203,6 +225,65 @@ static inline float toneChannel(float lin, int ch, const SpeakProfile& p)
     const float Dprn  = chainDensity(stops, ch, p);
     const float Dref  = chainDensity(0.0f, ch, p);   // print density at 18% gray
     return k18Gray * pow10f(-(Dprn - Dref));
+}
+
+// ---------------------------------------------------------------------------
+// Density-Space Subtractive Saturation + inter-image coupler (Phase 2). This
+// is *why film looks like film*: it works in log-density (where dye density
+// adds and transmittance multiplies), not in linear or HSL. Converting to
+// density, amplifying each dye's deviation from the neutral (gray) density, and
+// viewing back through 10^-D produces two structural signatures a linear 3x3
+// saturation cannot fake — highlight chroma self-compresses toward base white,
+// and hues skew toward the dye axes (from the asymmetric coupler). Neutral is
+// invariant by construction: the transform acts on deviations from D-bar, which
+// are zero on the gray axis. Standalone (usable on any grade).
+// ---------------------------------------------------------------------------
+static inline float density10(float lin)   // linear -> optical density (log10)
+{
+    return -std::log2(lin < 1e-6f ? 1e-6f : lin) * kLog10_2;  // log10 via log2 (parity-safe)
+}
+static inline float softCapKnee(float d, float cap)  // soft cap density at `cap`
+{
+    if (cap <= 0.0f) return d;                          // disabled
+    return cap - (1.0f / 8.0f) * softplusf(8.0f * (cap - d));
+}
+static inline void subtractiveColor(float r, float g, float b, const SpeakProfile& p,
+                                    float& oR, float& oG, float& oB)
+{
+    const float DR = density10(r), DG = density10(g), DB = density10(b);
+    const float Dbar = (DR + DG + DB) * (1.0f / 3.0f);
+    const float devR = DR - Dbar, devG = DG - Dbar, devB = DB - Dbar;
+    // diagonal = per-dye subtractive saturation; off-diagonals = inter-image
+    // coupler (unwanted-absorption cross terms). dyeCouple diagonal is unused.
+    const float cR = (1.0f + p.subSat[0]) * devR - (p.dyeCouple[1] * devG + p.dyeCouple[2] * devB);
+    const float cG = (1.0f + p.subSat[1]) * devG - (p.dyeCouple[3] * devR + p.dyeCouple[5] * devB);
+    const float cB = (1.0f + p.subSat[2]) * devB - (p.dyeCouple[6] * devR + p.dyeCouple[7] * devG);
+    const float DpR = softCapKnee(Dbar + cR, p.subSatKnee[0]);
+    const float DpG = softCapKnee(Dbar + cG, p.subSatKnee[1]);
+    const float DpB = softCapKnee(Dbar + cB, p.subSatKnee[2]);
+    oR = pow10f(-DpR); oG = pow10f(-DpG); oB = pow10f(-DpB);
+}
+static inline bool dyeActive(const SpeakProfile& p)
+{
+    return p.subSat[0] != 0.0f || p.subSat[1] != 0.0f || p.subSat[2] != 0.0f ||
+           p.dyeCouple[1] != 0.0f || p.dyeCouple[2] != 0.0f || p.dyeCouple[3] != 0.0f ||
+           p.dyeCouple[5] != 0.0f || p.dyeCouple[6] != 0.0f || p.dyeCouple[7] != 0.0f;
+}
+
+// The generic dye cross-absorption pattern. The hue skew lives ENTIRELY in the
+// within-row asymmetry (the density deviations sum to zero, so equal cross terms
+// in a row would collapse to a plain saturation boost). Follows the classic
+// published unwanted absorptions — cyan absorbs mostly green, magenta mostly
+// blue, yellow mostly green — behavior-named, cloning no stock. Verified by the
+// Macbeth CIELAB control arm (test/test_speak_macbeth.cpp).
+static const float kCouplerRG = 0.28f, kCouplerRB = 0.06f;
+static const float kCouplerGR = 0.08f, kCouplerGB = 0.30f;
+static const float kCouplerBR = 0.04f, kCouplerBG = 0.22f;
+static inline void setDyeCoupler(SpeakProfile& p, float amount)
+{
+    p.dyeCouple[1] = kCouplerRG * amount; p.dyeCouple[2] = kCouplerRB * amount;
+    p.dyeCouple[3] = kCouplerGR * amount; p.dyeCouple[5] = kCouplerGB * amount;
+    p.dyeCouple[6] = kCouplerBR * amount; p.dyeCouple[7] = kCouplerBG * amount;
 }
 
 // ---------------------------------------------------------------------------
@@ -338,9 +419,10 @@ static inline void processPixel(float r, float g, float b,
     const SpeakProfile& p = pr.profile;
     const int cs = pr.inputColorSpace;
     const bool toneOn = (pr.enableTone != 0) && (pr.strength > 0.0f);
+    const bool dyeOn  = (pr.enableDye != 0) && dyeActive(p);
     const bool bake   = (pr.outputMode == SPEAK_OUT_BAKE_REC709);
 
-    if (!toneOn && !bake) {
+    if (!toneOn && !dyeOn && !bake) {
         // Working space + no look: bit-exact pass-through (identity). Scopes
         // may still overwrite below.
         outR = r; outG = g; outB = b;
@@ -356,6 +438,10 @@ static inline void processPixel(float r, float g, float b,
             mg = lerpf(lg, toneChannel(lg, 1, p), s);
             mb = lerpf(lb, toneChannel(lb, 2, p), s);
         }
+        // Subtractive color sits after the print curve, in the density domain
+        // (the spine's dye stage), and is standalone: it runs with the tone
+        // spine off so the knob works on any grade.
+        if (dyeOn) subtractiveColor(mr, mg, mb, p, mr, mg, mb);
         if (bake) {
             // Output CST: gamut-convert to Rec.709 and encode gamma 2.4. Applies
             // regardless of the look (it is delivery, not a look) — a hard gamut
@@ -425,7 +511,7 @@ static inline SpeakProfile neutralProfile()
         p.prnDmin[c] = 0.10f; p.prnDmax[c] = 3.30f; p.prnGamma[c] = 2.60f;
         p.prnToe[c]  = 3.5f;  p.prnShoulder[c] = 2.2f; p.prnSpeed[c] = -1.75f;
         p.printerLights[c] = 0.0f;
-        p.subSat[c] = 0.0f; p.subSatKnee[c] = 1.0f;
+        p.subSat[c] = 0.0f; p.subSatKnee[c] = 0.0f;   // 0 = subtractive color off / knee disabled
         p.splitShadow[c] = 0.0f; p.splitHigh[c] = 0.0f;
     }
     for (int k = 0; k < 9; ++k) p.dyeCouple[k] = 0.0f;

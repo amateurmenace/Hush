@@ -127,6 +127,10 @@ public:
         m_PrinterG      = fetchDoubleParam("printerG");
         m_PrinterB      = fetchDoubleParam("printerB");
         m_PrinterMaster = fetchDoubleParam("printerMaster");
+        m_EnableDye     = fetchBooleanParam("enableDye");
+        m_SubSat        = fetchDoubleParam("subSat");
+        m_DyeCoupler    = fetchDoubleParam("dyeCoupler");
+        m_DyeKnee       = fetchDoubleParam("dyeKnee");
         m_ViewMode      = fetchChoiceParam("viewMode");
         m_ScopeHD       = fetchBooleanParam("scopeHD");
         updateEnabledness();
@@ -151,13 +155,15 @@ public:
         if (om != SPEAK_OUT_WORKING) return false;        // bake always transforms
         if (m_ScopeHD->getValueAtTime(t)) return false;   // scope must still draw
         const bool toneOn = m_EnableTone->getValueAtTime(t) && (m_Strength->getValueAtTime(t) > 0.0);
-        if (!toneOn) { p_IdentityClip = m_SrcClip; p_IdentityTime = t; return true; }
+        const bool dyeOn  = m_EnableDye->getValueAtTime(t) &&
+                            (m_SubSat->getValueAtTime(t) > 0.0 || m_DyeCoupler->getValueAtTime(t) > 0.0);
+        if (!toneOn && !dyeOn) { p_IdentityClip = m_SrcClip; p_IdentityTime = t; return true; }
         return false;
     }
 
     virtual void changedParam(const OFX::InstanceChangedArgs& /*p_Args*/, const std::string& p_ParamName)
     {
-        if (p_ParamName == "enableTone") updateEnabledness();
+        if (p_ParamName == "enableTone" || p_ParamName == "enableDye") updateEnabledness();
     }
 
 private:
@@ -172,6 +178,10 @@ private:
         m_PrinterG->setEnabled(on);
         m_PrinterB->setEnabled(on);
         m_PrinterMaster->setEnabled(on);
+        const bool dye = m_EnableDye->getValue();
+        m_SubSat->setEnabled(dye);
+        m_DyeCoupler->setEnabled(dye);
+        m_DyeKnee->setEnabled(dye);
     }
 
     SpeakParams gatherParams(double t)
@@ -188,7 +198,8 @@ private:
         p.frameIndex      = static_cast<int>(std::floor(t + 0.5));
         p.viewMode        = vm;
         p.enableTone      = m_EnableTone->getValueAtTime(t) ? 1 : 0;
-        p.enableDye = p.enableSplit = p.enableOptics = 0;
+        p.enableDye       = m_EnableDye->getValueAtTime(t) ? 1 : 0;
+        p.enableSplit = p.enableOptics = 0;
         p.scopeHD         = m_ScopeHD->getValueAtTime(t) ? 1 : 0;
         p.scopeDensity = p.scopeVector = 0;
 
@@ -208,6 +219,14 @@ private:
         prof.printerLights[1] = static_cast<float>(m_PrinterG->getValueAtTime(t));
         prof.printerLights[2] = static_cast<float>(m_PrinterB->getValueAtTime(t));
         prof.printerMaster    = static_cast<float>(m_PrinterMaster->getValueAtTime(t));
+
+        // Subtractive color (Phase 2): one knob drives the per-dye saturation,
+        // one scales the shared dye cross-absorption pattern (speak_core.h).
+        const float sat  = static_cast<float>(m_SubSat->getValueAtTime(t));
+        const float knee = static_cast<float>(m_DyeKnee->getValueAtTime(t));
+        for (int c = 0; c < 3; ++c) { prof.subSat[c] = sat; prof.subSatKnee[c] = knee; }
+        speakcore::setDyeCoupler(prof, static_cast<float>(m_DyeCoupler->getValueAtTime(t)));
+
         p.profile = prof;
         return p;
     }
@@ -269,6 +288,10 @@ private:
     OFX::DoubleParam*  m_PrinterG;
     OFX::DoubleParam*  m_PrinterB;
     OFX::DoubleParam*  m_PrinterMaster;
+    OFX::BooleanParam* m_EnableDye;
+    OFX::DoubleParam*  m_SubSat;
+    OFX::DoubleParam*  m_DyeCoupler;
+    OFX::DoubleParam*  m_DyeKnee;
     OFX::ChoiceParam*  m_ViewMode;
     OFX::BooleanParam* m_ScopeHD;
 };
@@ -423,6 +446,31 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
     sDefDouble(p_Desc, page, "printerMaster", "Printer Light Master",
                "Master printing exposure in points — an overall lighter/darker print.",
                0.0, -12.0, 12.0, 0.1, grpTone);
+
+    // ------------------------------------------------- 3 · Subtractive Color
+    OFX::GroupParamDescriptor* grpDye = p_Desc.defineGroupParam("grpDye");
+    grpDye->setLabels("3 \xC2\xB7 Subtractive Color", "3 \xC2\xB7 Subtractive Color", "3 \xC2\xB7 Color");
+    grpDye->setOpen(true);
+    grpDye->setHint("Why film looks like film: saturation done in log-density like real dyes, "
+                    "not in linear or HSL. Highlights roll toward base white instead of "
+                    "blowing out, and hues bend toward the dye axes. Works on any grade — "
+                    "you don't need the Film Tone stage on.");
+
+    sDefBool(p_Desc, page, "enableDye", "Enable Subtractive Color",
+             "Toggle the density-domain color stage to compare.", true, grpDye);
+    sDefDouble(p_Desc, page, "subSat", "Subtractive Saturation",
+               "Saturation the film way: each dye's density deviation from neutral is "
+               "amplified, so highlight chroma self-compresses toward base white instead of "
+               "clipping the way a normal saturation does. Neutral tones are untouched by "
+               "construction. 0 = off.", 0.0, 0.0, 1.5, 0.01, grpDye);
+    sDefDouble(p_Desc, page, "dyeCoupler", "Color Coupler (Punch)",
+               "Inter-image coupling — the dyes' unwanted absorptions. Adds film's colour "
+               "separation and bends hues toward the dye axes; zero on the neutral axis by "
+               "construction. 0 = off.", 0.0, 0.0, 1.5, 0.01, grpDye);
+    sDefDouble(p_Desc, page, "dyeKnee", "Dye Dmax Knee",
+               "Soft ceiling on dye density, so deep colours self-limit like a real emulsion "
+               "instead of running away. Lower = tighter. 0 = no ceiling.",
+               2.2, 0.0, 4.0, 0.05, grpDye);
 
     // -------------------------------------------------------------- 5 · Inspect
     OFX::GroupParamDescriptor* grpInspect = p_Desc.defineGroupParam("grpInspect");

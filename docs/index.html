@@ -192,6 +192,32 @@
   .rnode.on b { color: var(--amber); }
   .rwire { width: 28px; height: 2px; background: #4a4a58; flex: none; }
 
+  /* ---------- sample node-tree simulation (Hush + Speak pipeline) ---------- */
+  .ntree { background: #191921; border: 1px solid #2c2c34; border-radius: var(--r-lg); padding: 22px 20px 20px; margin-top: 28px; }
+  .ntree .flow { display: flex; align-items: stretch; gap: 0; overflow-x: auto; padding-bottom: 4px; }
+  .nt { flex: none; min-width: 116px; background: #26262f; border: 1.5px solid #45454f; border-radius: 8px; padding: 11px 13px; cursor: pointer; transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease; color: #b9b9c6; text-align: left; }
+  .nt:hover { transform: translateY(-2px); }
+  .nt .st { font: 700 9px var(--mono); letter-spacing: .13em; color: #7a7a88; }
+  .nt b { display: block; font: 700 14px "Space Grotesk"; color: #e6e6ee; margin-top: 2px; }
+  .nt small { display: block; font: 500 10px var(--mono); color: #8a8a98; margin-top: 3px; letter-spacing: .03em; }
+  .nt.io { background: transparent; border-style: dashed; border-color: #3a3a44; min-width: 84px; }
+  .nt.sel { box-shadow: 0 0 0 1px #6a6a78; }
+  .nt.hush { border-color: var(--amber); } .nt.hush b { color: var(--amber); }
+  .nt.hush.sel, .nt.hush:hover { box-shadow: 0 0 0 1px var(--amber); }
+  .nt.speak { border-color: var(--orange); } .nt.speak b { color: var(--orange); }
+  .nt.speak.sel, .nt.speak:hover { box-shadow: 0 0 0 1px var(--orange); }
+  .wire { flex: none; align-self: center; width: 30px; height: 2px; background: #45454f; position: relative; overflow: hidden; }
+  .wire i { position: absolute; top: -2px; left: -6px; width: 6px; height: 6px; border-radius: 50%; background: var(--amber); animation: ntflow 3.2s linear infinite; }
+  @keyframes ntflow { from { left: -6px; } to { left: 30px; } }
+  .wire:nth-of-type(2) i { animation-delay: .35s; } .wire:nth-of-type(4) i { animation-delay: .7s; }
+  .wire:nth-of-type(6) i { animation-delay: 1.05s; } .wire:nth-of-type(8) i { animation-delay: 1.4s; }
+  .ntree .band { display: flex; align-items: center; gap: 10px; margin-top: 14px; font: 600 9.5px var(--mono); letter-spacing: .1em; text-transform: uppercase; color: #8a8a98; }
+  .ntree .band .ws { flex: 1; text-align: center; padding: 7px 10px; border: 1px dashed #3a3a44; border-radius: 6px; color: #a9a9b8; }
+  .ntree .band .rcm { flex: none; color: var(--orange); white-space: nowrap; }
+  .nt-detail { margin-top: 16px; background: #101015; border: 1px solid #2c2c34; border-radius: 8px; padding: 15px 18px; color: #c4c4d0; font-size: 14.5px; line-height: 1.55; }
+  .nt-detail .dt { font: 700 11px var(--mono); letter-spacing: .12em; text-transform: uppercase; margin-bottom: 5px; color: #e6e6ee; }
+  @media (prefers-reduced-motion: reduce) { .wire i { display: none; } }
+
   footer { padding: 54px 0 70px; }
   footer .credit { font-family: "Space Grotesk"; font-size: 19px; color: var(--green); }
   footer .credit a { color: var(--green); }
@@ -614,6 +640,54 @@ gain(band) = 1 + w · (σ_band/σ_ref − 1)      w = n/(n + 2000)   (confidence
   </div>
 </section>
 
+<section class="dark">
+  <div class="wrap">
+    <div class="kicker" style="color:var(--orange)">The next tool · in design</div>
+    <h2>Meet Speak.</h2>
+    <p class="lede" style="max-width:62ch"><b style="color:#fff">Hush quiets the noise. Speak gives the image its voice.</b> A free film-emulation tool for the <em>end</em> of your node tree — film-stock character, split toning, subtractive saturation, halation and grain. It works in DaVinci Wide Gamut (some steps in linear light), so Resolve Color Management delivers Rec.709, P3 or HDR from a single look.</p>
+
+    <div class="ntree" role="group" aria-label="Sample node tree">
+      <div class="flow">
+        <div class="nt io" data-t="Camera original" data-b="RAW or log straight off the sensor. Resolve's input transform brings it into the timeline's wide-gamut working space — the same space every node below works in.">
+          <span class="st">MEDIA</span><b>Camera</b><small>RAW / log</small></div>
+        <span class="wire"><i></i></span>
+        <div class="nt hush sel" data-t="Hush · denoise, first" data-b="Denoise before the grade amplifies noise — and while Hush can still see the original neighbour frames it stacks. Cache this node and grade in real time. It exports a clean-confidence matte that Speak reads downstream.">
+          <span class="st">NODE 1</span><b>Hush</b><small>Denoise · cached</small></div>
+        <span class="wire"><i></i></span>
+        <div class="nt" data-t="Balance" data-b="Your primary balance — exposure, white balance, contrast — in DaVinci Wide Gamut / Intermediate.">
+          <span class="st">NODE 2</span><b>Balance</b><small>Primary</small></div>
+        <span class="wire"><i></i></span>
+        <div class="nt" data-t="Grade" data-b="Curves, Power Windows, secondaries — the creative grade, still in the managed wide-gamut space.">
+          <span class="st">NODE 3</span><b>Grade</b><small>Curves · windows</small></div>
+        <span class="wire"><i></i></span>
+        <div class="nt speak" data-t="Speak · film, last" data-b="Film character, last: stock emulation, split toning, subtractive saturation, halation, bloom and grain. Most steps run in DaVinci Wide Gamut; the optical ones (halation, bloom) in linear light. Speak reads Hush's confidence matte to lay grain exactly where the image was cleaned most.">
+          <span class="st">NODE 4</span><b>Speak</b><small>Film · linear + DWG</small></div>
+        <span class="wire"><i></i></span>
+        <div class="nt io" data-t="Delivery" data-b="Resolve Color Management converts DaVinci Wide Gamut → Rec.709 (or P3 / HDR) at output. Build the look once; ship any format — the same Speak settings re-render correctly, because the character was built in a space wide enough to hold it.">
+          <span class="st">OUTPUT</span><b>Rec.709</b><small>via RCM</small></div>
+      </div>
+      <div class="band">
+        <span class="ws">◄ &nbsp;working space · DaVinci Wide Gamut / Intermediate&nbsp; ►</span>
+        <span class="rcm">RCM output → Rec.709 / P3 / HDR</span>
+      </div>
+      <div class="nt-detail" id="ntDetail" aria-live="polite"></div>
+    </div>
+
+    <div class="tips" style="grid-template-columns:repeat(3,1fr);margin-top:24px">
+      <div class="tipcard" style="background:#20202a;border-color:#33333e"><span class="tn" style="color:var(--orange)">Stock &amp; density</span>
+        <b style="color:#e6e6ee">Emulate film, from physics.</b>
+        <p style="color:#a9a9b8">Characteristic (H&amp;D) density curves and a subtractive dye model — generic stock families and a shoot-a-chart calibration path. Original science, not cloned profiles, with the curves shown on screen.</p></div>
+      <div class="tipcard" style="background:#20202a;border-color:#33333e"><span class="tn" style="color:var(--orange)">Subtractive color</span>
+        <b style="color:#e6e6ee">Saturation that behaves like film.</b>
+        <p style="color:#a9a9b8">Subtractive CMY mixing compresses highlight saturation and bends hue toward the dyes — the reason film reads like film — plus split toning by tonal range, done in the right domain.</p></div>
+      <div class="tipcard" style="background:#20202a;border-color:#33333e"><span class="tn" style="color:var(--orange)">Light &amp; grain</span>
+        <b style="color:#e6e6ee">Halation, bloom, gate weave, grain.</b>
+        <p style="color:#a9a9b8">The optical layer in linear light: red-weighted halation, veiling bloom, print shoulder, gate weave — finished with the design study's measured film grain.</p></div>
+    </div>
+    <p style="color:var(--sage);font-size:15px;margin-top:22px">A free rival to paid film tools like Dehancer and Film Look Creator — built from original color science, working in the free version of Resolve, and it shows its work. <a href="https://amateurmenace.github.io/Hush-OpenNR/whitepaper.html" style="color:var(--orange)">Read the approach →</a></p>
+  </div>
+</section>
+
 <section>
   <div class="wrap">
     <div class="kicker">Get it</div>
@@ -887,6 +961,25 @@ gain(band) = 1 + w · (σ_band/σ_ref − 1)      w = n/(n + 2000)   (confidence
     });
   }, { threshold: 0.4 });
   io.observe(chart);
+})();
+
+/* sample node-tree simulation: click a node to read what it does */
+(function () {
+  var tree = document.querySelector('.ntree');
+  if (!tree) return;
+  var detail = tree.querySelector('.nt-detail');
+  var nodes = tree.querySelectorAll('.nt');
+  function select(n) {
+    nodes.forEach(function (x) { x.classList.remove('sel'); });
+    n.classList.add('sel');
+    detail.innerHTML = '<div class="dt">' + n.getAttribute('data-t') + '</div>' + n.getAttribute('data-b');
+  }
+  nodes.forEach(function (n) {
+    n.setAttribute('tabindex', '0');
+    n.addEventListener('click', function () { select(n); });
+    n.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); select(n); } });
+  });
+  select(tree.querySelector('.nt.speak') || nodes[0]);
 })();
 </script>
 

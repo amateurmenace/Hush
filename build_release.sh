@@ -1,6 +1,17 @@
 #!/bin/bash
 # OpenNR — build a macOS release: universal .ofx bundle, double-clickable .pkg
 # installer, and a zip fallback with a .command install script.
+#
+# Release path (default): sign with Developer ID, notarize the BUNDLE, staple
+# it, and only then build the pkg and the zip from the stapled copy, so both
+# artifacts inherit a ticketed payload. Every missing credential is FATAL —
+# the fail-open guards this script used to have are exactly how 3.6.0 and
+# earlier shipped Gatekeeper-rejected while the script reported success.
+#
+# CI path (explicit, never silent): CI_UNSIGNED_DEV_BUILD=1 stages an
+# ad-hoc-signed bundle and zips it with "-ci-unsigned" in the name, so the
+# credential-less CI runner still exercises staging and packaging. That
+# artifact is a dev convenience, not a release, and its filename says so.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -16,23 +27,42 @@ STAGE="release/stage"
 mkdir -p "$STAGE"
 cp -R plugin/OpenNR.ofx.bundle "$STAGE/"
 
-echo "== signing =="
-# Prefer a Developer ID Application identity when one is present; fall back to
-# ad-hoc. (Notarization additionally requires --timestamp and hardened runtime.)
-DEV_ID=$(security find-identity -v -p codesigning 2>/dev/null | grep -o '"Developer ID Application: [^"]*"' | head -1 | tr -d '"') || true
-if [ -n "${DEV_ID:-}" ]; then
-    echo "signing with: $DEV_ID"
-    codesign --force --deep --timestamp --options runtime --sign "$DEV_ID" "$STAGE/OpenNR.ofx.bundle"
-else
-    echo "no Developer ID found — ad-hoc signing"
+if [ "${CI_UNSIGNED_DEV_BUILD:-0}" = "1" ]; then
+    echo "==============================================================="
+    echo "  CI_UNSIGNED_DEV_BUILD=1 — ad-hoc signing, NO notarization."
+    echo "  This artifact will not pass Gatekeeper and must never be"
+    echo "  published as a release."
+    echo "==============================================================="
     codesign --force --deep --sign - "$STAGE/OpenNR.ofx.bundle"
+    codesign --verify --deep "$STAGE/OpenNR.ofx.bundle"
+    cp "installer/Install OpenNR (macOS).command" "$STAGE/"
+    cp README.md LICENSE "$STAGE/"
+    (cd "$STAGE" && zip -qry "../OpenNR-$VERSION-macOS-ci-unsigned.zip" .)
+    echo
+    echo "CI dev artifact:"
+    ls -la release/*.zip
+    exit 0
 fi
+
+echo "== signing =="
+# Grep for the literal Developer ID string — the first identity on this
+# machine belongs to a different team, so `head -1` over the whole list is a
+# trap. Missing identity is fatal: notarization is mandatory below, and an
+# ad-hoc signature would only fail later at Apple's end with a worse error.
+DEV_ID=$(security find-identity -v -p codesigning 2>/dev/null | grep -o '"Developer ID Application: [^"]*"' | head -1 | tr -d '"') || true
+if [ -z "${DEV_ID:-}" ]; then
+    echo "FATAL: no Developer ID Application identity in the keychain."
+    echo "  A release build must be run on a machine that can sign and"
+    echo "  notarize. For an unsigned dev zip: CI_UNSIGNED_DEV_BUILD=1 $0"
+    exit 1
+fi
+echo "signing with: $DEV_ID"
+codesign --force --deep --timestamp --options runtime --sign "$DEV_ID" "$STAGE/OpenNR.ofx.bundle"
 codesign --verify --deep "$STAGE/OpenNR.ofx.bundle"
 
 echo "== sanity: minimum macOS of the shipped binary =="
 otool -arch arm64 -l "$STAGE/OpenNR.ofx.bundle/Contents/MacOS/OpenNR.ofx" | grep -m1 minos
 
-echo "== pkg installer =="
 # Ticket the BUNDLE first. Everything we ship contains it, so both artifacts
 # then inherit a stapled payload. Order is the whole trick: the old script
 # notarized at the end and built the zip afterwards from an unstapled stage, so

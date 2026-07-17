@@ -32,16 +32,19 @@ jobs:
       - name: Build plugin (universal)
         run: make -C plugin
 
-      - name: Package
-        run: ./build_release.sh
+      # The runner has no signing identity and no notary profile, and the
+      # release path is now fatal without them (fail-open guards are how
+      # 3.6.0 and earlier shipped Gatekeeper-rejected). CI_UNSIGNED_DEV_BUILD=1
+      # is the explicit dev branch: ad-hoc signed, no pkg, "-ci-unsigned" in
+      # the artifact name. Real releases are built and notarized locally.
+      - name: Package (unsigned dev zip)
+        run: CI_UNSIGNED_DEV_BUILD=1 ./build_release.sh
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: OpenNR-macOS
-          path: |
-            release/*.pkg
-            release/*.zip
+          name: OpenNR-macOS-ci-unsigned
+          path: release/*.zip
 
   windows:
     runs-on: windows-latest

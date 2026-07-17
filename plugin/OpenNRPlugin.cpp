@@ -83,7 +83,7 @@ static uint32_t boostParamsHash(const NRParams& p)
     "MIT-licensed and free forever."
 #define kPluginIdentifier "org.opennr.Denoise"
 #define kPluginVersionMajor 3
-#define kPluginVersionMinor 8
+#define kPluginVersionMinor 7
 
 #define kSupportsTiles false
 #define kSupportsMultiResolution false
